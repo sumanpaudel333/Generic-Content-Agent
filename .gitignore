@@ -1,0 +1,20 @@
+# Business config -- your real details, never committed
+config/config.yaml
+
+# Secrets
+.env
+
+# Python
+venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# Local runtime data
+logs/*.db
+logs/*.log
+logs/*.jsonl
+data/
+
+# Trained model artifacts (large binaries -- distribute separately)
+*.gguf

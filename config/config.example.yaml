@@ -1,0 +1,57 @@
+# Copy this file to config.yaml and fill in your own business details.
+# config.yaml is gitignored -- your real business info never gets committed.
+
+business:
+  name: "Your Company Name"
+  # One sentence describing what you sell and where. This gets fed directly
+  # into the model's system prompt, so keep it concise and factual.
+  description: "a short description of your business, e.g. a regional building supplies company with two physical locations"
+  locations: ["Location A", "Location B"]
+  service_regions: ["Region 1", "Region 2", "Region 3"]
+  phone_display: ""   # e.g. "(02) 5555 0100" -- leave blank to omit from generated copy
+  phone_tel: ""        # e.g. "+61255550100" -- digits only, used in tel: links
+
+# Some product catalogs have a category that legally or operationally needs
+# a standard disclaimer attached (e.g. mixed-to-order materials with a
+# shelf life, hazardous goods, perishables, custom-cut items). This section
+# is OPTIONAL -- set enabled: false if your catalog has no such category.
+regulated_product:
+  enabled: true
+  # Case-insensitive regex matched against the product title to decide
+  # whether a product falls into this category.
+  keyword_pattern: '\bRegulated\b'
+  disclaimer_html: |
+    <p><b>Important Information for Regulated Products</b><br> Some products in our
+    catalog are prepared or mixed to order and have handling requirements that
+    differ from standard stock items. Please confirm order details before
+    delivery or pickup.</p>
+    <p><b style="color:red;">This product category requires confirmation prior to
+    delivery or pickup. Please contact us with any questions before ordering.</b></p>
+
+  # Optional: if products in this category have a specific formulation/mix
+  # ratio worth extracting from the title and injecting verbatim (rather
+  # than letting the model restate it), set a regex here. Leave blank to
+  # disable. Example pattern below matches things like "8% 12:1".
+  ratio_pattern: '(\d{1,2})%\s*(\d{1,2}):(\d{1,2})'
+  ratio_label: "Mixed to a ratio of"
+
+  # Optional: a second extractable quantity detail, e.g. component counts.
+  # Example pattern below matches things like "4x20kg cement".
+  quantity_detail_pattern: '(\d+)\s*[x\u00d7]\s*(\d+)\s*kg\s*(?:\w+\s*)?(\w+)'
+
+# Product IDs with a verified, real compliance/standards claim. Never let
+# the model state a standard on its own -- if a product genuinely carries
+# one, it belongs here and gets injected by code at assembly time.
+standards_whitelist: {}
+# example:
+#   "1234": "AS 1234:2020 -- short description of what it certifies"
+
+models:
+  small_model_name: "content-agent"     # the Ollama model tag you `ollama create` this as
+  ollama_url: "http://127.0.0.1:11434/api/chat"
+  claude_model: "claude-sonnet-4-6"
+
+pipeline:
+  daily_batch_size: 10
+  daily_run_delay_seconds: 1.0
+  thin_content_char_threshold: 300
