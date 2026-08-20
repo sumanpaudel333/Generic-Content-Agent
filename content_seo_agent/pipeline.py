@@ -16,6 +16,7 @@ import os
 from datetime import datetime, timezone
 
 from content_seo_agent import small_model_client, claude_client, confidence, review_queue, title_parser
+from content_seo_agent.constants import TaskType, Source
 from config.settings import STANDARDS_WHITELIST
 
 LOG_PATH = os.path.join(os.path.dirname(__file__), "..", "logs", "agent_runs.log")
@@ -37,13 +38,13 @@ def process_classification(product_id, title: str, description: str = "") -> dic
     """Runs classification with small-model-first, Claude-escalation-on-low-confidence."""
     result = small_model_client.classify(title, description)
     conf = confidence.score_classification(result)
-    source = "small_model"
+    source = Source.SMALL_MODEL
 
     if conf.should_escalate:
         _log_run(product_id, "classify", "escalating", "; ".join(conf.reasons))
         result = claude_client.classify(title, description)
         conf = confidence.score_classification(result)
-        source = "claude"
+        source = Source.CLAUDE
         if conf.should_escalate:
             _log_run(product_id, "classify", "failed_both", "; ".join(conf.reasons))
         else:
@@ -54,7 +55,7 @@ def process_classification(product_id, title: str, description: str = "") -> dic
     row = review_queue.add_to_queue(
         product_id=product_id,
         title=title,
-        task_type="classify",
+        task_type=TaskType.CLASSIFY,
         source=source,
         parsed_output=result.get("parsed"),
         confidence=conf.confidence,
@@ -72,13 +73,13 @@ def process_drafting(product_id, title: str) -> dict:
 
     result = small_model_client.draft(title)
     conf = confidence.score_draft(result, title, verified_claims)
-    source = "small_model"
+    source = Source.SMALL_MODEL
 
     if conf.should_escalate:
         _log_run(product_id, "draft", "escalating", "; ".join(conf.reasons))
         result = claude_client.draft(title)
         conf = confidence.score_draft(result, title, verified_claims)
-        source = "claude"
+        source = Source.CLAUDE
         if conf.safety_flags:
             # Even Claude isn't trusted blindly on fabricated compliance
             # claims -- this always forces human attention regardless
@@ -94,7 +95,7 @@ def process_drafting(product_id, title: str) -> dict:
     row = review_queue.add_to_queue(
         product_id=product_id,
         title=title,
-        task_type="draft",
+        task_type=TaskType.DRAFT,
         source=source,
         parsed_output=result.get("parsed"),
         confidence=conf.confidence,

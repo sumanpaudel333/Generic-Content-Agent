@@ -55,3 +55,11 @@ pipeline:
   daily_batch_size: 10
   daily_run_delay_seconds: 1.0
   thin_content_char_threshold: 300
+
+# Reviewer-facing behavior in the dashboard (dashboard/app.py). Change these
+# to fit how your team wants to work the queue without touching code.
+approval_flow:
+  auto_publish_on_approve: true   # false = approve and publish become two separate steps
+  require_reject_reason: false    # true = reviewer must type a reason to reject
+  page_size: 25                   # rows per page on Pending/Needs Retry/History
+  min_overview_length: 15         # drafts with a shorter overview are treated as low confidence

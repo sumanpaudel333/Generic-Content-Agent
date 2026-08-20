@@ -16,8 +16,8 @@ everything comes from config.yaml.
 
 Output (in --output-dir):
     classify_train.jsonl / classify_val.jsonl
-    draft_train.jsonl    / draft_val.jsonl
-    combined_train.jsonl / combined_val.jsonl   (both tasks merged --
+    draft_train.jsonl / draft_val.jsonl
+    combined_train.jsonl / combined_val.jsonl  (both tasks merged --
         recommended for fine-tuning a single model that handles both)
 
 Requires your export to have product_id/product_title/product_description

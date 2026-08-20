@@ -2,14 +2,40 @@
 Odoo connector.
 
 Abstract base + XML-RPC implementation. Falls back to DRY RUN mode
-automatically if ODOO_URL/ODOO_DB/ODOO_USERNAME/ODOO_API_KEY aren't
-set in .env -- this lets the publish flow be tested end-to-end
-(assembly, dashboard, status tracking) before real Odoo credentials
-are wired in, without any risk of a misconfigured write.
+automatically if the active environment's URL/DB/USERNAME/API_KEY
+aren't resolvable from .env -- this lets the publish flow be tested
+end-to-end (assembly, dashboard, status tracking) before real Odoo
+credentials are wired in, without any risk of a misconfigured write.
+
+Staging vs live: set ODOO_ENV=staging|live in .env to pick which
+instance to talk to, with the URL for each coming from
+ODOO_URL_STAGING / ODOO_URL_LIVE. Defaults to "staging" when unset,
+so a missing/blank ODOO_ENV can never accidentally point at the live
+catalog. ODOO_DB is optional -- if not set explicitly, it's derived
+from the active URL's subdomain (Odoo Online databases are named
+after their *.odoo.com / *.dev.odoo.com subdomain), which also means
+it keeps working after a custom-domain migration since the
+underlying database name doesn't change, only the public URL does.
+Set ODOO_DB explicitly once you know it to stop relying on that
+derivation.
 """
 import os
+import re
 import xmlrpc.client
 from abc import ABC, abstractmethod
+from urllib.parse import urlparse
+
+
+def _derive_db_name(url: str) -> str:
+    """Odoo Online database names match the subdomain, e.g.
+    https://bcsands.odoo.com -> "bcsands", or
+    https://bcsands-wmssofttest08082026-36107756.dev.odoo.com -> the
+    full "bcsands-wmssofttest08082026-36107756" staging db name.
+    Returns "" if the URL doesn't look like an Odoo Online address
+    (e.g. a self-hosted domain), where the db name can't be guessed."""
+    host = (urlparse(url).netloc or "").split(":")[0]
+    match = re.match(r"^(.+?)\.(?:dev\.odoo\.com|odoo\.com)$", host)
+    return match.group(1) if match else ""
 
 
 class BaseConnector(ABC):
@@ -29,8 +55,12 @@ class BaseConnector(ABC):
 
 class OdooConnector(BaseConnector):
     def __init__(self):
-        self.url = os.environ.get("ODOO_URL", "")
-        self.db = os.environ.get("ODOO_DB", "")
+        self.env_name = os.environ.get("ODOO_ENV", "staging").strip().lower()
+        if self.env_name == "live":
+            self.url = os.environ.get("ODOO_URL_LIVE", "")
+        else:
+            self.url = os.environ.get("ODOO_URL_STAGING", "")
+        self.db = os.environ.get("ODOO_DB", "") or _derive_db_name(self.url)
         self.username = os.environ.get("ODOO_USERNAME", "")
         self.api_key = os.environ.get("ODOO_API_KEY", "")
         self._uid = None
@@ -106,8 +136,10 @@ class OdooConnector(BaseConnector):
             return {
                 "success": False,
                 "dry_run": True,
-                "detail": "Odoo not configured (.env missing ODOO_URL/ODOO_DB/ODOO_USERNAME/ODOO_API_KEY). "
-                           "No write attempted -- this is expected until real credentials are added.",
+                "detail": f"Odoo ({self.env_name}) not configured -- .env missing one of "
+                           f"ODOO_URL_{self.env_name.upper()}/ODOO_DB/ODOO_USERNAME/ODOO_API_KEY "
+                           f"(ODOO_DB can be left blank if the URL is a *.odoo.com address). "
+                           f"No write attempted -- this is expected until real credentials are added.",
             }
         try:
             uid = self._authenticate()
@@ -117,9 +149,10 @@ class OdooConnector(BaseConnector):
                 "product.template", "write",
                 [[int(product_id)], {"description_sale": html_description}],
             )
-            return {"success": True, "dry_run": False, "detail": f"Written to Odoo product_id={product_id}"}
+            return {"success": True, "dry_run": False,
+                     "detail": f"Written to Odoo ({self.env_name}) product_id={product_id}"}
         except Exception as e:
-            return {"success": False, "dry_run": False, "detail": f"Odoo write failed: {e}"}
+            return {"success": False, "dry_run": False, "detail": f"Odoo ({self.env_name}) write failed: {e}"}
 
 
 # Single shared instance for the app to import

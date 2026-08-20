@@ -88,6 +88,15 @@ DAILY_RUN_DELAY_SECONDS = float(_pipeline_cfg.get("daily_run_delay_seconds", 1.0
 THIN_CONTENT_CHAR_THRESHOLD = int(_pipeline_cfg.get("thin_content_char_threshold", 300))
 
 # ---------------------------------------------------------------------------
+# Approval flow (reviewer dashboard behavior)
+# ---------------------------------------------------------------------------
+_approval_cfg = _cfg.get("approval_flow", {}) or {}
+APPROVAL_AUTO_PUBLISH = bool(_approval_cfg.get("auto_publish_on_approve", True))
+APPROVAL_REQUIRE_REJECT_REASON = bool(_approval_cfg.get("require_reject_reason", False))
+APPROVAL_PAGE_SIZE = int(_approval_cfg.get("page_size", 25))
+MIN_OVERVIEW_LENGTH = int(_approval_cfg.get("min_overview_length", 15))
+
+# ---------------------------------------------------------------------------
 # Derived: system prompts
 #
 # IMPORTANT: if you fine-tune a small model against these prompts (see

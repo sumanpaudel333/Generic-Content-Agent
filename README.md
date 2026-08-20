@@ -76,6 +76,7 @@ connectors/
   odoo_connector.py       XML-RPC connector (abstract base class -- add your own
                            platform's connector following the same interface)
 content_seo_agent/
+  constants.py             Canonical status/task_type/source vocabulary
   title_parser.py         Deterministic fact extraction from product titles
   content_status.py       Deterministic classification of what needs drafting
   small_model_client.py   Calls your locally-hosted fine-tuned model (via Ollama)
@@ -115,15 +116,32 @@ cp config/config.example.yaml config/config.yaml
 
 Fill in your business name, locations, service area, and (optionally) the "regulated product" category if some of your catalog needs a standard disclaimer or has extractable specification details worth preserving verbatim. Leave `regulated_product.enabled: false` if this doesn't apply to your catalog.
 
+`config.yaml` also has an `approval_flow` section controlling how the review dashboard behaves, so your team can tune the reviewer workflow without touching code:
+
+```yaml
+approval_flow:
+  auto_publish_on_approve: true   # false = approve and publish become two separate steps
+  require_reject_reason: false    # true = reviewer must type a reason to reject
+  page_size: 25                   # rows per page on Pending/Needs Retry/History
+  min_overview_length: 15         # drafts with a shorter overview are treated as low confidence
+```
+
 Create a `.env` file:
 ```
 ANTHROPIC_API_KEY=your_key_here
-ODOO_URL=
+
+# Odoo Online -- ODOO_ENV picks which URL below is active. Defaults to
+# "staging" if left blank, so it can never accidentally point at live.
+ODOO_ENV=staging
+ODOO_URL_STAGING=
+ODOO_URL_LIVE=
 ODOO_DB=
 ODOO_USERNAME=
 ODOO_API_KEY=
 ```
 Leave the Odoo values blank to run everything in dry-run mode (no real writes attempted, safe for testing).
+
+`ODOO_DB` can usually be left blank for an Odoo Online (`*.odoo.com`) instance -- it's auto-derived from whichever URL is active (the database name matches the subdomain, e.g. `bcsands.odoo.com` -> db `bcsands`). Set it explicitly once you know it, since it keeps working even after the URL later moves to a custom domain, and it's required for a self-hosted (non-`*.odoo.com`) instance where it can't be guessed. Switch to live by setting `ODOO_ENV=live` once staging is verified.
 
 ### 3. Get a small model running (optional but recommended)
 

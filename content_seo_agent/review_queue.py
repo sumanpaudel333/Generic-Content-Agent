@@ -7,9 +7,11 @@ moved from JSONL to SQLite. If storage changes again later (e.g. to
 Postgres), this is the only file that should need to change.
 """
 from content_seo_agent.db import (
-    add_to_queue, get_row, list_rows, update_status, counts_by_status, publish_row,
+    add_to_queue, get_row, list_rows, count_rows, update_status, update_parsed_output, reopen_row,
+    counts_by_status, publish_row,
 )
 
 __all__ = [
-    "add_to_queue", "get_row", "list_rows", "update_status", "counts_by_status", "publish_row",
+    "add_to_queue", "get_row", "list_rows", "count_rows", "update_status", "update_parsed_output",
+    "reopen_row", "counts_by_status", "publish_row",
 ]

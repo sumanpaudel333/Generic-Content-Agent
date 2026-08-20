@@ -1,6 +1,7 @@
 requests
 python-dotenv
 fastapi
+python-multipart
 uvicorn[standard]
 pandas
 openpyxl

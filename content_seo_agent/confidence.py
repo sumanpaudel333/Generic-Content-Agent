@@ -10,15 +10,16 @@ that a reviewer should pay extra attention to.
 """
 from dataclasses import dataclass, field
 
+from config import settings
 from content_seo_agent.safety_filter import scan_draft_json
+from content_seo_agent.content_status import NEEDS_DRAFTING, NEEDS_DISCLAIMER_ONLY
 
 REQUIRED_DRAFT_FIELDS = ["overview", "features", "applications"]
 REQUIRED_CLASSIFY_FIELDS = ["is_regulated", "content_status", "product_type"]
 
-VALID_CONTENT_STATUS = {
-    "missing", "thin", "plain_text_needs_formatting",
-    "regulated_missing_disclaimer", "good",
-}
+# Reuses the same status set content_status.py's deterministic classifier
+# produces, so this validation can never drift out of sync with it.
+VALID_CONTENT_STATUS = NEEDS_DRAFTING | NEEDS_DISCLAIMER_ONLY | {"good"}
 VALID_PRODUCT_TYPE = {"bulk_bag", "roll", "bagged", "each_or_pack", "other"}
 
 
@@ -67,7 +68,7 @@ def score_draft(result: dict, title: str = "", verified_claims: list[str] | None
         reasons.append(f"missing fields: {missing_fields}")
 
     overview = parsed.get("overview", "")
-    if not overview or len(overview) < 15:
+    if not overview or len(overview) < settings.MIN_OVERVIEW_LENGTH:
         reasons.append("overview missing or too short")
 
     features = parsed.get("features", [])

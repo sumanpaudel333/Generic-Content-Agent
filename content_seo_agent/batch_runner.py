@@ -7,11 +7,12 @@ Usage (from project root, C:\\BCSands\\agents):
     python -m content_seo_agent.batch_runner --input path\\to\\export.xlsx
 
 Useful flags:
-    --limit N            Only process the first N matching products (good for a trial run)
-    --statuses a,b,c      Override which content_status values to target
-                          (default: missing,thin,plain_text_needs_formatting)
-    --delay 1.5           Seconds to wait between products (default 1.0)
-    --force               Reprocess products even if already in the review queue
+    --limit N Only process the first N matching products (good for a trial run)
+    --statuses a,b,c Override which content_status values to target
+                          (default: content_status.NEEDS_DRAFTING)
+    --delay 1.5 Seconds to wait between products
+                          (default: config.yaml's pipeline.daily_run_delay_seconds)
+    --force Reprocess products even if already in the review queue
 
 Resume behaviour: by default, any product_id already present in the
 review queue (any status -- pending, approved, rejected) is skipped.
@@ -34,7 +35,9 @@ load_dotenv()
 import pandas as pd
 
 from content_seo_agent import pipeline, review_queue, content_status as cs
+from content_seo_agent.constants import TaskType, Source
 from content_seo_agent.small_model_client import is_available as small_model_available
+from config import settings
 
 SUMMARY_LOG_PATH = os.path.join(os.path.dirname(__file__), "..", "logs", "batch_run_summary.log")
 
@@ -93,8 +96,8 @@ def load_products(input_path: str) -> pd.DataFrame:
 
 
 def get_already_processed_ids() -> set:
-    rows = review_queue.list_rows()
-    return {str(r["product_id"]) for r in rows if r["task_type"] == "draft"}
+    rows = review_queue.list_rows(task_type=TaskType.DRAFT)
+    return {str(r["product_id"]) for r in rows}
 
 
 def process_dataframe(df: pd.DataFrame, limit: int | None, target_statuses: set, delay: float, force: bool) -> dict:
@@ -151,7 +154,7 @@ def process_dataframe(df: pd.DataFrame, limit: int | None, target_statuses: set,
         try:
             draft_row = pipeline.process_drafting(product_id, title)
             results["processed"] += 1
-            if draft_row.get("source") == "claude":
+            if draft_row.get("source") == Source.CLAUDE:
                 results["escalated"] += 1
             if draft_row.get("safety_flags"):
                 results["safety_flagged"] += 1
@@ -199,10 +202,13 @@ if __name__ == "__main__":
     parser.add_argument("--input", required=True, help="Path to product export (.xlsx or .csv)")
     parser.add_argument("--limit", type=int, default=None, help="Max products to process this run")
     parser.add_argument(
-        "--statuses", default="missing,thin,plain_text_needs_formatting",
+        "--statuses", default=",".join(sorted(cs.NEEDS_DRAFTING)),
         help="Comma-separated content_status values to target",
     )
-    parser.add_argument("--delay", type=float, default=1.0, help="Seconds between products")
+    parser.add_argument(
+        "--delay", type=float, default=settings.DAILY_RUN_DELAY_SECONDS,
+        help="Seconds between products",
+    )
     parser.add_argument("--force", action="store_true", help="Reprocess even if already in the queue")
     args = parser.parse_args()
 

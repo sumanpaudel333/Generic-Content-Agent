@@ -45,7 +45,7 @@ from datetime import datetime, timezone
 DAILY_BATCH_SIZE = int(os.environ.get("DAILY_BATCH_SIZE", settings.DAILY_BATCH_SIZE))
 DELAY_SECONDS = float(os.environ.get("DAILY_RUN_DELAY", settings.DAILY_RUN_DELAY_SECONDS))
 # Fallback source if your platform connector isn't configured for live pulls yet.
-FALLBACK_EXPORT_PATH = os.environ.get("FALLBACK_PRODUCT_EXPORT", os.path.join("data", "product_export.xlsx"))
+FALLBACK_EXPORT_PATH = os.environ.get("FALLBACK_PRODUCT_EXPORT", os.path.join("data", "Product-data.xlsx"))
 
 
 def get_current_products() -> tuple[pd.DataFrame, str]:
