@@ -25,6 +25,16 @@ import xmlrpc.client
 from abc import ABC, abstractmethod
 from urllib.parse import urlparse
 
+# product.template field the assembled HTML gets written to. Deliberately
+# NOT description_sale ("Sales Description") -- that's a plain `text`
+# field shown on quotes/sales orders, not the website, and being plain
+# text it can't render HTML at all (tags show up literally). This is
+# `html`-typed and is what actually renders on the eCommerce product page.
+# Confirmed via product.template.fields_get() against the real instance
+# rather than assumed from general Odoo docs, since this can vary by
+# version/install.
+DESCRIPTION_FIELD = "description_ecommerce"
+
 
 def _derive_db_name(url: str) -> str:
     """Odoo Online database names match the subdomain, e.g.
@@ -80,6 +90,23 @@ class OdooConnector(BaseConnector):
     def _models(self):
         return xmlrpc.client.ServerProxy(f"{self.url}/xmlrpc/2/object")
 
+    def _find_by_sku(self, sku) -> int | None:
+        """Every product_id flowing through this system is a SKU (Odoo
+        calls this field "Internal Reference", stored as default_code) --
+        never Odoo's own internal numeric id, which is a separate,
+        unrelated value. This resolves SKU -> internal id right before
+        any read/write, so callers never have to think about the
+        distinction."""
+        uid = self._authenticate()
+        models = self._models()
+        ids = models.execute_kw(
+            self.db, uid, self.api_key,
+            "product.template", "search",
+            [[["default_code", "=", str(sku)]]],
+            {"limit": 1},
+        )
+        return ids[0] if ids else None
+
     def get_product(self, product_id) -> dict | None:
         if not self.is_configured():
             return None
@@ -87,9 +114,9 @@ class OdooConnector(BaseConnector):
         models = self._models()
         results = models.execute_kw(
             self.db, uid, self.api_key,
-            "product.template", "read",
-            [[int(product_id)]],
-            {"fields": ["id", "name", "description_sale"]},
+            "product.template", "search_read",
+            [[["default_code", "=", str(product_id)]]],
+            {"fields": ["id", "name", "default_code", DESCRIPTION_FIELD], "limit": 1},
         )
         return results[0] if results else None
 
@@ -105,14 +132,21 @@ class OdooConnector(BaseConnector):
         Returns a list of {"product_id", "product_title", "product_description"}
         dicts, matching the shape batch_runner.load_products() produces
         from a static file, so downstream code doesn't need to care
-        which source it came from.
+        which source it came from. product_id here is the SKU
+        (default_code / "Internal Reference"), same identifier scheme
+        the Pronto backlog export uses -- so review queue rows stay
+        addressable the same way regardless of which source produced
+        them, and no reprocessing is needed when the backlog source
+        eventually gets fully replaced by this live pull. Products with
+        no Internal Reference set are skipped -- there'd be no way to
+        write back to them later under this scheme.
         """
         if not self.is_configured():
             raise RuntimeError("Odoo not configured -- cannot list_products()")
 
         uid = self._authenticate()
         models = self._models()
-        kwargs = {"fields": ["id", "name", "description_sale"], "offset": offset}
+        kwargs = {"fields": ["id", "default_code", "name", DESCRIPTION_FIELD], "offset": offset}
         if limit is not None:
             kwargs["limit"] = limit
 
@@ -122,14 +156,21 @@ class OdooConnector(BaseConnector):
             [[["active", "=", True]]],
             kwargs,
         )
-        return [
-            {
-                "product_id": r["id"],
+        products = []
+        skipped_no_sku = 0
+        for r in results:
+            sku = r.get("default_code")
+            if not sku:
+                skipped_no_sku += 1
+                continue
+            products.append({
+                "product_id": sku,
                 "product_title": r.get("name", ""),
-                "product_description": r.get("description_sale") or "",
-            }
-            for r in results
-        ]
+                "product_description": r.get(DESCRIPTION_FIELD) or "",
+            })
+        if skipped_no_sku:
+            print(f"NOTE: skipped {skipped_no_sku} Odoo product(s) with no Internal Reference (SKU) set.")
+        return products
 
     def write_product_description(self, product_id, html_description: str) -> dict:
         if not self.is_configured():
@@ -142,15 +183,22 @@ class OdooConnector(BaseConnector):
                            f"No write attempted -- this is expected until real credentials are added.",
             }
         try:
+            odoo_id = self._find_by_sku(product_id)
+            if odoo_id is None:
+                return {
+                    "success": False, "dry_run": False,
+                    "detail": f"Odoo ({self.env_name}) write failed: no product found with "
+                               f"Internal Reference (SKU) '{product_id}'",
+                }
             uid = self._authenticate()
             models = self._models()
             models.execute_kw(
                 self.db, uid, self.api_key,
                 "product.template", "write",
-                [[int(product_id)], {"description_sale": html_description}],
+                [[odoo_id], {DESCRIPTION_FIELD: html_description}],
             )
             return {"success": True, "dry_run": False,
-                     "detail": f"Written to Odoo ({self.env_name}) product_id={product_id}"}
+                     "detail": f"Written to Odoo ({self.env_name}) sku={product_id} (id={odoo_id})"}
         except Exception as e:
             return {"success": False, "dry_run": False, "detail": f"Odoo ({self.env_name}) write failed: {e}"}
 

@@ -27,7 +27,7 @@ load_dotenv()
 from fastapi import FastAPI, Form, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 
-from content_seo_agent import review_queue, small_model_client
+from content_seo_agent import review_queue, small_model_client, assembler
 from content_seo_agent.assembler import assemble_html
 from content_seo_agent.constants import Status, TaskType, Source
 from connectors.odoo_connector import odoo_connector  # must import after load_dotenv()
@@ -85,6 +85,9 @@ def _page_shell(body: str) -> str:
         .edit-toggle-btn {{ background: none; border: none; color: #78716c; font-size: 12px;
                               cursor: pointer; padding: 2px 0; margin-top: 2px; text-decoration: underline; }}
         .edit-toggle-btn:hover {{ color: #292524; }}
+        .tail-block {{ background: #fafaf9; border-top: 1px dashed #e7e5e4; margin-top: 8px;
+                         padding-top: 8px; color: #57534e; }}
+        .tail-block p {{ margin: 0 0 8px 0; }}
         .edit-mode-actions {{ display: flex; gap: 8px; margin-top: 4px; }}
         .save-edit-btn {{ background: #2563eb; color: white; border: none; border-radius: 6px;
                             padding: 5px 12px; font-size: 12px; cursor: pointer; font-weight: 500; }}
@@ -157,15 +160,22 @@ def _page_shell(body: str) -> str:
                 .split('\\n').map(s => s.trim()).filter(Boolean);
             const applications = wrap.querySelector('textarea[data-field="applications"]').value
                 .split('\\n').map(s => s.trim()).filter(Boolean);
+            // The mix-ratio line (regulated products) is a fixed, non-editable fact
+            // computed server-side -- prepended as-is, matching assembler.py.
+            const mixLineTemplate = wrap.querySelector('.mixline-template');
+            const mixLine = mixLineTemplate ? mixLineTemplate.innerHTML.trim() : '';
 
             let out = '';
             if (overview) out += `<div class="field-label">Overview</div><p>${{escapeHtml(overview)}}</p>`;
-            if (features.length) out += `<div class="field-label">Features</div><ul>` +
-                features.map(f => `<li>${{escapeHtml(f)}}</li>`).join('') + `</ul>`;
+            if (features.length || mixLine) {{
+                const featureItems = features.map(f => `<li>${{escapeHtml(f)}}</li>`).join('');
+                out += `<div class="field-label">Features</div><ul>` +
+                    (mixLine ? `<li>${{mixLine}}</li>` : '') + featureItems + `</ul>`;
+            }}
             if (applications.length) out += `<div class="field-label">Applications</div><ul>` +
                 applications.map(a => `<li>${{escapeHtml(a)}}</li>`).join('') + `</ul>`;
 
-            wrap.querySelector('.view-mode .preview').innerHTML = out || '<span class="meta">(no content)</span>';
+            wrap.querySelector('.editable-preview').innerHTML = out || '<span class="meta">(no content)</span>';
             wrap.querySelector('.edit-mode').style.display = 'none';
             wrap.querySelector('.view-mode').style.display = 'block';
         }}
@@ -217,6 +227,19 @@ def _draft_preview_html(parsed: dict) -> str:
         f'<pre>{html.escape(json.dumps(parsed, indent=2, ensure_ascii=False))}</pre></details>'
     )
     return preview + raw
+
+
+def _readonly_content_html(row: dict, parsed: dict) -> str:
+    """For draft rows that already have an assembled_html (approved at
+    least once), shows that exact HTML -- the real thing that was or
+    will be sent to Odoo -- rather than re-deriving a preview from the
+    raw draft JSON. Falls back to the plain draft preview otherwise."""
+    if row.get("assembled_html"):
+        return (
+            '<div class="meta">Final assembled HTML (as published/attempted):</div>'
+            f'<div class="preview">{row["assembled_html"]}</div>'
+        )
+    return _draft_preview_html(parsed)
 
 
 def _filter_bar_html(active: dict, base_path: str) -> str:
@@ -279,20 +302,36 @@ def _pagination_html(base_path: str, query: dict, page: int, total: int, page_si
     )
 
 
-def _editable_draft_fields_html(row_id: int, parsed: dict) -> str:
-    """Read-only preview by default (matching non-editable rows), with a
-    small Edit toggle that swaps in textareas client-side -- no page
-    reload, nothing sent to the server until Approve/Reject is actually
-    submitted. The textareas stay present (just hidden) in view mode so
-    an edit made and then re-hidden via Save still submits correctly."""
-    content = _render_draft_content_html(parsed)
+def _editable_draft_fields_html(row_id: int, parsed: dict, is_regulated: bool, ratio: str, quantity_detail: str) -> str:
+    """Shows the FULL assembled HTML a reviewer is actually approving --
+    not just the model's raw draft -- built with the exact same
+    assembler.py functions used at publish time, so there's no gap
+    between what's reviewed and what goes to Odoo. The delivery/
+    disclaimer tail is shown but not editable (it's centrally controlled
+    via config.yaml, not per-product); only overview/features/
+    applications can be edited. Read-only by default, with a small Edit
+    toggle that swaps in textareas client-side -- nothing is sent to the
+    server until Approve/Reject is actually submitted."""
+    editable_html = assembler.build_editable_parts_html(parsed, is_regulated, ratio, quantity_detail)
+    tail_html = assembler.build_fixed_tail_html(is_regulated)
+    mix_line_html = assembler.build_mix_line_html(is_regulated, ratio, quantity_detail)
+
     overview = html.escape(str(parsed.get("overview", "")))
     features = html.escape("\n".join(str(f) for f in (parsed.get("features") or [])))
     applications = html.escape("\n".join(str(a) for a in (parsed.get("applications") or [])))
+
+    tail_note = (
+        '<div class="meta">+ fixed Delivery &amp; Pickup / disclaimer copy below '
+        '(centrally controlled, not editable here)</div>'
+        if tail_html else ""
+    )
+
     return f"""
     <div class="draft-content" data-row-id="{row_id}">
         <div class="view-mode">
-            <div class="preview">{content or '<span class="meta">(no content)</span>'}</div>
+            <div class="preview editable-preview">{editable_html}</div>
+            {tail_note}
+            <div class="preview tail-block">{tail_html}</div>
             <button type="button" class="edit-toggle-btn" onclick="toggleEdit({row_id})"
                     title="Edit description">&#9998; Edit</button>
         </div>
@@ -303,11 +342,13 @@ def _editable_draft_fields_html(row_id: int, parsed: dict) -> str:
             <textarea name="features" class="edit-field" data-field="features" rows="4">{features}</textarea>
             <div class="field-label">Applications (one per line)</div>
             <textarea name="applications" class="edit-field" data-field="applications" rows="3">{applications}</textarea>
+            <div class="meta">Delivery &amp; Pickup / disclaimer copy is appended automatically and can't be edited here.</div>
             <div class="edit-mode-actions">
                 <button type="button" class="save-edit-btn" onclick="saveEdit({row_id})">Save</button>
                 <button type="button" class="cancel-edit-btn" onclick="cancelEdit({row_id})">Cancel</button>
             </div>
         </div>
+        <template class="mixline-template">{mix_line_html}</template>
     </div>
     <details class="raw-json"><summary>View original raw JSON</summary>
         <pre>{html.escape(json.dumps(parsed, indent=2, ensure_ascii=False))}</pre>
@@ -378,7 +419,12 @@ def _card_html(row: dict, *, show_publish_retry: bool = False, show_reopen: bool
     if row["status"] == Status.PENDING:
         checkbox = f'<input type="checkbox" class="row-check checkbox-col" name="id" value="{row["id"]}" form="bulk-form">'
 
-    content_html = _editable_draft_fields_html(row['id'], parsed) if editable else _draft_preview_html(parsed)
+    content_html = (
+        _editable_draft_fields_html(
+            row['id'], parsed, bool(row.get('is_regulated')), row.get('ratio') or '', row.get('quantity_detail') or ''
+        )
+        if editable else _readonly_content_html(row, parsed)
+    )
     body = f"""
         <div class="card-header">
             <div class="card-header-left">
