@@ -1,0 +1,101 @@
+{
+  "_comment": "Synthetic conversations in the Chatbase v1 get-conversations shape. Content is invented, not real customer data, but the structure mirrors the live API: ISO created_at, message.content as a plain string, min_score, form_submission, country, and no per-message feedback field.",
+  "data": [
+    {
+      "source": "Widget or Iframe",
+      "id": "conv_001",
+      "form_submission": {"name": "Sample Customer", "email": "sample@example.com.au", "phone": "0412 345 678"},
+      "min_score": 0.71,
+      "created_at": "2026-08-18T09:12:00.000000+00:00",
+      "last_message_at": "2026-08-18T09:18:00.000000+00:00",
+      "country": "Australia",
+      "messages": [
+        {"id": "m1", "role": "assistant", "type": "text", "content": "Hi! What can I help you with?", "createdAt": "2026-08-18T09:12:00.000000+00:00"},
+        {"id": "m2", "role": "user", "type": "text", "content": "Do you deliver bulk bags of sand to Cronulla?", "createdAt": "2026-08-18T09:12:30.000000+00:00"},
+        {"id": "m3", "role": "assistant", "type": "text", "content": "Yes, we deliver throughout the Sutherland Shire including Cronulla. Bulk bags can be craned onto site.", "createdAt": "2026-08-18T09:13:00.000000+00:00"},
+        {"id": "m4", "role": "user", "type": "text", "content": "Great, I need 2 bulk bags of washed river sand. My number is 0412 345 678 and I'm at 14 Gannons Road Cronulla.", "createdAt": "2026-08-18T09:17:00.000000+00:00"},
+        {"id": "m5", "role": "assistant", "type": "text", "content": "I can help with that. Someone from our team will call to confirm delivery and pricing.", "createdAt": "2026-08-18T09:18:00.000000+00:00"}
+      ]
+    },
+    {
+      "source": "Widget or Iframe",
+      "id": "conv_002",
+      "form_submission": null,
+      "min_score": 0.31,
+      "created_at": "2026-08-19T02:40:00.000000+00:00",
+      "last_message_at": "2026-08-19T02:41:00.000000+00:00",
+      "country": "Australia",
+      "messages": [
+        {"id": "m1", "role": "user", "type": "text", "content": "What is the coverage of the Hebel adhesive 20kg bag?", "createdAt": "2026-08-19T02:40:00.000000+00:00"},
+        {"id": "m2", "role": "assistant", "type": "text", "content": "I don't have that information. Please contact us on (02) 8543 3401 and our team can help.", "createdAt": "2026-08-19T02:41:00.000000+00:00"}
+      ]
+    },
+    {
+      "source": "Widget or Iframe",
+      "id": "conv_003",
+      "form_submission": null,
+      "min_score": 0.82,
+      "created_at": "2026-08-20T04:15:00.000000+00:00",
+      "last_message_at": "2026-08-20T04:20:00.000000+00:00",
+      "country": "Australia",
+      "messages": [
+        {"id": "m1", "role": "user", "type": "text", "content": "Do you have pool chlorine 15L in stock at Taren Point?", "createdAt": "2026-08-20T04:15:00.000000+00:00"},
+        {"id": "m2", "role": "assistant", "type": "text", "content": "Yes, Chlorine Pool 15L is stocked at Taren Point. Note it is sold with a container deposit.", "createdAt": "2026-08-20T04:17:00.000000+00:00"},
+        {"id": "m3", "role": "user", "type": "text", "content": "Perfect thanks", "createdAt": "2026-08-20T04:20:00.000000+00:00"}
+      ]
+    },
+    {
+      "source": "Widget or Iframe",
+      "id": "conv_004",
+      "form_submission": null,
+      "min_score": 0.28,
+      "created_at": "2026-08-21T06:05:00.000000+00:00",
+      "last_message_at": "2026-08-21T06:12:00.000000+00:00",
+      "country": "Australia",
+      "messages": [
+        {"id": "m1", "role": "user", "type": "text", "content": "My order was supposed to arrive yesterday and nothing turned up. This is the second time.", "createdAt": "2026-08-21T06:05:00.000000+00:00"},
+        {"id": "m2", "role": "assistant", "type": "text", "content": "I'm sorry about that. I cannot help with order tracking. Please contact our team directly.", "createdAt": "2026-08-21T06:08:00.000000+00:00"},
+        {"id": "m3", "role": "user", "type": "text", "content": "That is not good enough, I have been waiting all week. Email me at jane.smith@example.com.au", "createdAt": "2026-08-21T06:12:00.000000+00:00"}
+      ]
+    },
+    {
+      "source": "Widget or Iframe",
+      "id": "conv_005",
+      "form_submission": null,
+      "min_score": 0.77,
+      "created_at": "2026-08-22T23:30:00.000000+00:00",
+      "last_message_at": "2026-08-22T23:36:00.000000+00:00",
+      "country": "Australia",
+      "messages": [
+        {"id": "m1", "role": "user", "type": "text", "content": "How many pavers do I need for a 20 square metre patio?", "createdAt": "2026-08-22T23:30:00.000000+00:00"},
+        {"id": "m2", "role": "assistant", "type": "text", "content": "That depends on the paver size. For a standard 400x400mm paver you would need approximately 125 pavers for 20 square metres, plus 5-10% for cuts and wastage.", "createdAt": "2026-08-22T23:33:00.000000+00:00"},
+        {"id": "m3", "role": "user", "type": "text", "content": "Thanks, and what is the price per paver?", "createdAt": "2026-08-22T23:35:00.000000+00:00"},
+        {"id": "m4", "role": "assistant", "type": "text", "content": "Pricing varies by range. You can see current pricing on the product pages, or call us for a quote on a full pallet.", "createdAt": "2026-08-22T23:36:00.000000+00:00"}
+      ]
+    },
+    {
+      "source": "Widget or Iframe",
+      "id": "conv_006",
+      "form_submission": null,
+      "min_score": 0.9,
+      "created_at": "2026-08-23T01:00:00.000000+00:00",
+      "last_message_at": "2026-08-23T01:00:00.000000+00:00",
+      "country": "Australia",
+      "messages": [
+        {"id": "m1", "role": "user", "type": "text", "content": "hello", "createdAt": "2026-08-23T01:00:00.000000+00:00"}
+      ]
+    },
+    {
+      "source": "Widget or Iframe",
+      "id": "conv_OUT_OF_WINDOW",
+      "form_submission": null,
+      "min_score": 0.6,
+      "created_at": "2024-01-15T00:00:00.000000+00:00",
+      "last_message_at": "2024-01-15T00:05:00.000000+00:00",
+      "country": "Australia",
+      "messages": [
+        {"id": "m1", "role": "user", "type": "text", "content": "This is from long before the reporting window.", "createdAt": "2024-01-15T00:00:00.000000+00:00"}
+      ]
+    }
+  ]
+}

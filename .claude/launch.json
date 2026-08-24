@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "content-seo-dashboard",
+      "runtimeExecutable": "venv/Scripts/python.exe",
+      "runtimeArgs": ["-m", "uvicorn", "dashboard.app:app", "--host", "127.0.0.1", "--port", "8420"],
+      "port": 8420
+    }
+  ]
+}
