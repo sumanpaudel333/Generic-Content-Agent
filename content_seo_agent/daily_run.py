@@ -49,8 +49,18 @@ FALLBACK_EXPORT_PATH = os.environ.get("FALLBACK_PRODUCT_EXPORT", os.path.join("d
 
 
 def get_current_products() -> tuple[pd.DataFrame, str]:
-    """Returns (dataframe, source_description)."""
-    if odoo_connector.is_configured():
+    """Returns (dataframe, source_description).
+
+    Deliberately checks settings.USE_ODOO_AS_PRODUCT_SOURCE, not just
+    odoo_connector.is_configured() -- those are different questions.
+    Odoo being "configured" only means write-back works once a draft is
+    approved; it says nothing about whether Odoo is the right place to
+    pull the CURRENT product list from right now. While working through
+    an initial backlog import (e.g. from another system), Odoo can be
+    fully configured for publish-testing while use_odoo_as_product_source
+    stays false, so new-product fetching keeps using the backlog file
+    until that's explicitly flipped."""
+    if settings.USE_ODOO_AS_PRODUCT_SOURCE and odoo_connector.is_configured():
         try:
             print("Pulling live product list from Odoo...")
             products = odoo_connector.list_products()

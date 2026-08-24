@@ -96,6 +96,15 @@ def load_products(input_path: str) -> pd.DataFrame:
 
 
 def get_already_processed_ids() -> set:
+    """Product IDs that already have a draft row, at ANY status.
+
+    Rejected products are deliberately included here, so a scheduled run never
+    silently re-drafts something a person turned down -- at best it would burn
+    model calls reproducing the same rejected copy, at worst it would loop
+    forever. Giving a rejected product another attempt is an explicit action
+    instead: the dashboard's Rejected tab, which calls
+    pipeline.regenerate_draft_for_row() with a higher temperature and the
+    rejection reason as context."""
     rows = review_queue.list_rows(task_type=TaskType.DRAFT)
     return {str(r["product_id"]) for r in rows}
 

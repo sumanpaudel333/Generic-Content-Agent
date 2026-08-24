@@ -59,16 +59,18 @@ def build_editable_parts_html(draft_json: dict, is_regulated: bool, ratio: str, 
 
     parts = [f"<p>{overview}</p>"]
 
+    heading_style = settings.heading_style_attr()
+
     mix_line = build_mix_line_html(is_regulated, ratio, quantity_detail)
     if features:
         if mix_line:
             features = [mix_line] + features
         feature_items = "\n".join(f"  <li>{f}</li>" for f in features)
-        parts.append(f"<p><b>Features & Benefits:</b></p>\n<ul>\n{feature_items}\n</ul>")
+        parts.append(f"<p><b{heading_style}>Features & Benefits:</b></p>\n<ul>\n{feature_items}\n</ul>")
 
     if applications:
         app_items = "\n".join(f"  <li>{a}</li>" for a in applications)
-        parts.append(f"<p><b>Applications:</b></p>\n<ul>\n{app_items}\n</ul>")
+        parts.append(f"<p><b{heading_style}>Applications:</b></p>\n<ul>\n{app_items}\n</ul>")
 
     return "\n\n".join(parts)
 

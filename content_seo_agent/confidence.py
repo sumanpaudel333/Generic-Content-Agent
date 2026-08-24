@@ -11,8 +11,8 @@ that a reviewer should pay extra attention to.
 from dataclasses import dataclass, field
 
 from config import settings
-from content_seo_agent.safety_filter import scan_draft_json
 from content_seo_agent.content_status import NEEDS_DRAFTING, NEEDS_DISCLAIMER_ONLY
+from content_seo_agent.safety_filter import scan_draft_json
 
 REQUIRED_DRAFT_FIELDS = ["overview", "features", "applications"]
 REQUIRED_CLASSIFY_FIELDS = ["is_regulated", "content_status", "product_type"]

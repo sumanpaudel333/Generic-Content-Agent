@@ -42,6 +42,7 @@ LOCATIONS = _business.get("locations", [])
 SERVICE_REGIONS = _business.get("service_regions", [])
 PHONE_DISPLAY = _business.get("phone_display", "")
 PHONE_TEL = _business.get("phone_tel", "")
+HEADING_COLOR = _business.get("heading_color", "")
 
 # ---------------------------------------------------------------------------
 # Regulated / special-handling product category (optional)
@@ -86,6 +87,7 @@ _pipeline_cfg = _cfg.get("pipeline", {}) or {}
 DAILY_BATCH_SIZE = int(_pipeline_cfg.get("daily_batch_size", 10))
 DAILY_RUN_DELAY_SECONDS = float(_pipeline_cfg.get("daily_run_delay_seconds", 1.0))
 THIN_CONTENT_CHAR_THRESHOLD = int(_pipeline_cfg.get("thin_content_char_threshold", 300))
+USE_ODOO_AS_PRODUCT_SOURCE = bool(_pipeline_cfg.get("use_odoo_as_product_source", False))
 
 # ---------------------------------------------------------------------------
 # Approval flow (reviewer dashboard behavior)
@@ -95,6 +97,29 @@ APPROVAL_AUTO_PUBLISH = bool(_approval_cfg.get("auto_publish_on_approve", True))
 APPROVAL_REQUIRE_REJECT_REASON = bool(_approval_cfg.get("require_reject_reason", False))
 APPROVAL_PAGE_SIZE = int(_approval_cfg.get("page_size", 25))
 MIN_OVERVIEW_LENGTH = int(_approval_cfg.get("min_overview_length", 15))
+REGENERATE_TEMPERATURE = float(_approval_cfg.get("regenerate_temperature", 0.8))
+REGENERATE_ESCALATE_FIRST = bool(_approval_cfg.get("regenerate_escalate_first", False))
+
+# ---------------------------------------------------------------------------
+# Chat Insights (weekly Chatbase analysis)
+# ---------------------------------------------------------------------------
+_chat_cfg = _cfg.get("chat_insights", {}) or {}
+CHAT_ENABLED = bool(_chat_cfg.get("enabled", False))
+CHAT_AGENT_ID = str(_chat_cfg.get("chatbase_agent_id", "") or "")
+CHAT_API_BASE = str(_chat_cfg.get("api_base", "https://www.chatbase.co/api/v1")).rstrip("/")
+CHAT_LOOKBACK_DAYS = int(_chat_cfg.get("lookback_days", 7))
+CHAT_PAGE_SIZE = max(1, min(100, int(_chat_cfg.get("page_size", 100))))
+CHAT_MAX_PAGES = int(_chat_cfg.get("max_pages", 50))
+CHAT_REQUEST_DELAY_SECONDS = float(_chat_cfg.get("request_delay_seconds", 0.2))
+CHAT_MODEL = str(_chat_cfg.get("model", "llama3.2:3b"))
+CHAT_TEMPERATURE = float(_chat_cfg.get("temperature", 0.2))
+CHAT_MAX_ANALYSIS_TOKENS = int(_chat_cfg.get("max_analysis_tokens", 400))
+CHAT_MIN_USER_MESSAGES = int(_chat_cfg.get("min_user_messages_for_analysis", 1))
+CHAT_REDACT_EMAIL = bool(_chat_cfg.get("redact_email", True))
+CHAT_REPORT_RECIPIENTS = list(_chat_cfg.get("report_recipients", []) or [])
+CHAT_SMTP_HOST = str(_chat_cfg.get("smtp_host", "") or "")
+CHAT_SMTP_PORT = int(_chat_cfg.get("smtp_port", 587))
+CHAT_SMTP_FROM = str(_chat_cfg.get("smtp_from", "") or "")
 
 # ---------------------------------------------------------------------------
 # Derived: system prompts
@@ -132,6 +157,14 @@ SYSTEM_DRAFT = (
 )
 
 
+def heading_style_attr() -> str:
+    """style="color:..." attribute for section headings (Features & Benefits,
+    Applications, Delivery & Pickup) in generated copy, or "" if no brand
+    color is configured -- shared so every heading across the assembled
+    HTML stays visually consistent from one config value."""
+    return f' style="color:{HEADING_COLOR}"' if HEADING_COLOR else ""
+
+
 def delivery_html() -> str:
     if not LOCATIONS:
         return ""
@@ -144,7 +177,7 @@ def delivery_html() -> str:
     ) if SERVICE_REGIONS else ""
     regions_clause = f", including {regions_str}, and beyond" if regions_str else ""
     return (
-        f"<p><b>Delivery & Pickup:</b><br>\n"
+        f"<p><b{heading_style_attr()}>Delivery & Pickup:</b><br>\n"
         f"With locations at {locations_str}, {BUSINESS_NAME} supplies products throughout "
         f"the surrounding area{regions_clause}. Choose to <b>collect in-store "
         f"or arrange delivery</b> directly to your site with flexible scheduling at "

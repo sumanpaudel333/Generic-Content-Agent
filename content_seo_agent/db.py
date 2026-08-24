@@ -15,8 +15,8 @@ not raw SQL.
 import json
 import os
 import sqlite3
-from datetime import datetime, timezone
 from contextlib import contextmanager
+from datetime import datetime, timezone
 
 from content_seo_agent.constants import Status
 
@@ -59,6 +59,8 @@ _MIGRATION_COLUMNS = [
     ("published_at", "TEXT"),
     ("odoo_write_detail", "TEXT"),
     ("edited", "INTEGER DEFAULT 0"),
+    ("attempt_count", "INTEGER DEFAULT 1"),
+    ("last_rejection_note", "TEXT"),
 ]
 
 
@@ -236,6 +238,48 @@ def reopen_row(row_id: int) -> dict | None:
         conn.execute(
             "UPDATE review_queue SET status = ?, reviewed_at = NULL, reviewer_note = '' WHERE id = ?",
             (Status.PENDING, row_id),
+        )
+    return get_row(row_id)
+
+
+def apply_regenerated_draft(row_id: int, parsed_output: dict | None, source: str,
+                             confidence: str, reasons: list[str], safety_flags: list[str]) -> dict | None:
+    """Replaces a row's model output with a freshly generated draft and puts it
+    back in the review queue.
+
+    Used to give a rejected product another go rather than leaving it stranded:
+    without this, a rejected product_id stays in the queue forever and is
+    permanently skipped by batch_runner's dedup, so nothing would ever draft
+    it again.
+
+    The reviewer's rejection reason is carried into last_rejection_note so the
+    next reviewer can see why the previous attempt was turned down, and
+    attempt_count is incremented so repeated failures are visible rather than
+    silently looping. The `edited` flag is cleared -- this is fresh model
+    output, not something a human has touched."""
+    init_db()
+    with _connect() as conn:
+        row = conn.execute("SELECT reviewer_note, attempt_count FROM review_queue WHERE id = ?",
+                            (row_id,)).fetchone()
+        if row is None:
+            return None
+        previous_note = row["reviewer_note"] or ""
+        attempts = (row["attempt_count"] or 1) + 1
+        conn.execute(
+            """UPDATE review_queue
+               SET parsed_output = ?, source = ?, confidence = ?, reasons = ?, safety_flags = ?,
+                   status = ?, reviewed_at = NULL, reviewer_note = '',
+                   last_rejection_note = ?, attempt_count = ?, edited = 0,
+                   assembled_html = NULL, published = 0, published_at = NULL, odoo_write_detail = NULL
+               WHERE id = ?""",
+            (
+                json.dumps(parsed_output, ensure_ascii=False) if parsed_output else None,
+                source, confidence,
+                json.dumps(reasons, ensure_ascii=False),
+                json.dumps(safety_flags, ensure_ascii=False),
+                Status.PENDING,
+                previous_note, attempts, row_id,
+            ),
         )
     return get_row(row_id)
 

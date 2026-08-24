@@ -42,6 +42,21 @@ CLAIM_PATTERNS = [
 # to check reliably.
 QUANTITY_NUMBER_RE = re.compile(r"\b(\d{1,3}(?:,\d{3})+|\d{3,})\b")
 
+# Extracting numbers FROM THE TITLE deliberately uses a looser pattern than
+# the one above. Product titles run numbers straight into letters
+# ("120x56mm", "900x13x0.56x2m", "Acid 15L"), where \b does not match -- so
+# the strict pattern finds nothing and a perfectly correct number that the
+# model spaced out as "120 x 56mm" looks fabricated. On this catalog that
+# affected the majority of titles, causing needless escalations and bogus
+# "unverified claim" flags.
+#
+# Loosening only the title side is safe: the question being asked is "does
+# this number appear anywhere in the source?", so a broader read of the
+# source can only prevent false alarms. The genuine failure this guards
+# against still trips -- title "Roll of 2000" vs draft "20,000" gives title
+# numbers {2000}, and 20000 is still absent from it.
+TITLE_NUMBER_RE = re.compile(r"\d[\d,]*")
+
 
 def scan_for_unverified_claims(text: str, verified_claims: list[str] | None = None) -> list[str]:
     """
@@ -87,12 +102,13 @@ def scan_for_quantity_mismatches(title: str, text: str) -> list[str]:
     if not text:
         return []
 
-    title_numbers = {n.replace(",", "") for n in QUANTITY_NUMBER_RE.findall(title)}
+    title_numbers = {n.replace(",", "").lstrip("0") or "0"
+                      for n in TITLE_NUMBER_RE.findall(title)}
     text_numbers = QUANTITY_NUMBER_RE.findall(text)
 
     flagged = []
     for raw_num in text_numbers:
-        normalized = raw_num.replace(",", "")
+        normalized = raw_num.replace(",", "").lstrip("0") or "0"
         if normalized not in title_numbers:
             flagged.append(raw_num)
 

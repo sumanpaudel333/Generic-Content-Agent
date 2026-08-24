@@ -88,8 +88,21 @@ content_seo_agent/
   pipeline.py             Ties it all together for a single product
   batch_runner.py         CLI batch processor with resume + rate limiting
   daily_run.py            The single job to schedule once every 24 hours
+chat_insights/
+  chatbase_client.py      Chatbase v1 API: server-side date filter + paging
+  db.py                   SQLite store for runs, conversations and analyses
+  redact.py               Strips customer PII from the emailed report
+  llm.py                  General local model client (not the fine-tuned one)
+  analyzer.py             Deterministic stats + per-conversation model pass
+  reporter.py             Renders the HTML report
+  mailer.py               Sends it (stdlib smtplib)
+  weekly_run.py           The weekly job
+scripts/
+  register_scheduled_tasks.ps1  Registers both scheduled jobs in Task Scheduler
 dashboard/
-  app.py                  FastAPI review dashboard (approve/reject/publish)
+  app.py                  Automation Control Dashboard -- routes for each module
+  auth.py                 Login, sessions, users (PBKDF2 hashes, stdlib only)
+  ui.py                   Theme, page shell, module registry (add new tabs here)
 training/
   prepare_training_data.py  Builds fine-tuning JSONL from your catalog export
   fine_tune_model.ipynb     Colab notebook: LoRA fine-tune + GGUF export
@@ -129,6 +142,15 @@ approval_flow:
 Create a `.env` file:
 ```
 ANTHROPIC_API_KEY=your_key_here
+
+# Dashboard sign-in -- only read on FIRST run, to seed the initial admin.
+DASHBOARD_ADMIN_USER=admin
+DASHBOARD_ADMIN_PASSWORD=
+
+# Chat Insights (optional) -- weekly Chatbase analysis emailed to a manager.
+CHATBASE_API_KEY=
+SMTP_USERNAME=
+SMTP_PASSWORD=
 
 # Odoo Online -- ODOO_ENV picks which URL below is active. Defaults to
 # "staging" if left blank, so it can never accidentally point at live.
@@ -172,6 +194,12 @@ python -m uvicorn dashboard.app:app --host 0.0.0.0 --port 8420
 ```
 Visit `http://localhost:8420`.
 
+**Signing in.** The dashboard requires a login. On first run it seeds an admin account from `DASHBOARD_ADMIN_USER`/`DASHBOARD_ADMIN_PASSWORD` in `.env`; if no password is set there, a random one is generated and **printed to the server console once** at startup -- copy it before the terminal scrolls. After that, users are managed in-app under **Settings -> Users** (admins can add users, reset passwords, and disable accounts). Passwords are stored as salted PBKDF2-HMAC-SHA256 hashes in `logs/dashboard_auth.db`, separate from the review queue database.
+
+**Layout.** The dashboard is an *Automation Control* shell with one top-level tab per automation. **Content Agent** is the first: its Review queue / Needs retry / History tabs are the human checkpoint described above. To add another automation, register it in `MODULES` in `dashboard/ui.py` and add its routes in `dashboard/app.py` -- navigation, theming, and auth come from the shell.
+
+> The dashboard has no transport encryption of its own. On anything beyond a trusted LAN, put it behind a reverse proxy terminating HTTPS -- session cookies would otherwise travel in the clear.
+
 ### 5. Try it on a few products
 
 ```bash
@@ -185,9 +213,48 @@ python -m content_seo_agent.batch_runner --input your_export.xlsx --limit 10
 ```
 Accepts `.xlsx` or `.csv` with `product_id`, `product_title`, `product_description` columns (or positionally, if your export has no header row -- this is auto-detected).
 
-### 7. Schedule the ongoing job
+### 7. Schedule the ongoing jobs
 
-`content_seo_agent/daily_run.py` is the single job to schedule once every 24 hours (Windows Task Scheduler, cron, whatever fits your environment). It sources live from your connected platform if configured, falls back to a static export otherwise, and processes up to `pipeline.daily_batch_size` products per run (from `config.yaml`). The same job naturally covers both an initial catalog backfill and ongoing new-product detection -- there's no separate mode to switch, because resume/dedup logic means it just finds less to do each day as the backlog clears.
+`content_seo_agent/daily_run.py` is the single job to schedule once every 24 hours. It sources live from your connected platform if configured, falls back to a static export otherwise, and processes up to `pipeline.daily_batch_size` products per run (from `config.yaml`). The same job naturally covers both an initial catalog backfill and ongoing new-product detection -- there's no separate mode to switch, because resume/dedup logic means it just finds less to do each day as the backlog clears.
+
+On Windows, register both scheduled jobs at once from an **elevated** PowerShell:
+
+```powershell
+.\scripts\register_scheduled_tasks.ps1
+```
+
+That creates `BCSands-ContentAgent-Daily` (02:00 daily) and `BCSands-ChatInsights-Weekly` (03:00 Mondays), each logging to `logs/`. Override with `-DailyAt`, `-WeeklyAt`, `-WeeklyOn`. Check with `Get-ScheduledTask -TaskName 'BCSands-*'`.
+
+## Chat Insights (optional module)
+
+A second automation: once a week it pulls your Chatbase conversations, works out what happened in them, and emails a manager a report covering **questions the bot could not answer**, what customers asked about, likely sales leads, volume, and anyone who left negative feedback.
+
+```bash
+python -m chat_insights.weekly_run --dry-run                    # show config status and the target window
+python -m chat_insights.weekly_run --fixture tests/fixtures/chatbase_sample.json --no-email
+python -m chat_insights.weekly_run                              # the real weekly job
+```
+
+Setup (all under `chat_insights:` in `config.yaml`, secrets in `.env`):
+
+1. **Chatbase** -- put the API key in `CHATBASE_API_KEY`, then find your agent id with:
+   ```bash
+   python -m chat_insights.weekly_run --list-agents
+   ```
+   and put it in `chatbase_agent_id`. The agent id is **not** the API key -- they are different values, and pasting the key into both is an easy mistake to make.
+2. **A general local model** -- `ollama pull llama3.2:3b`. This must NOT be the fine-tuned content model: that one is trained to emit product-description JSON and cannot summarise a conversation. Size it to your hardware; 3B suits a CPU-only host, larger models need more RAM and considerably more time.
+3. **SMTP** -- `smtp_host`/`smtp_from`/`report_recipients` in config, `SMTP_USERNAME`/`SMTP_PASSWORD` in `.env`.
+
+Design notes worth knowing:
+
+- **Deterministic first.** Volume, per-day counts, negative feedback and bot-failure detection are computed in code; the model is only asked for topic, category, sentiment, lead detection and a one-line summary per conversation. On a CPU-only host every avoided generation is real time saved.
+- **This uses Chatbase's v1 API, not v2.** v2 (`/api/v2/agents/{id}/conversations`) returns an empty list for these agents; v1 (`/api/v1/get-conversations`) has the actual conversations *and* supports server-side `startDate`/`endDate`. The exact `[start, end)` boundary is still enforced on timestamps locally, because v1's date filter is whole-day and its inclusivity is undocumented.
+- **A wrong agent id fails silently.** Chatbase answers an unknown agent with `200` and an empty list rather than a 404, so a misconfiguration looks exactly like "no chats this week". Use `--list-agents` to confirm, and check the conversation count on the first run.
+- **v1 exposes no per-message feedback**, so thumbs-down cannot be read from the API. Unhappy customers are inferred from sentiment plus the failure heuristics. v1 does provide `min_score` (retrieval confidence) and `form_submission`, both of which are used -- a submitted contact form counts as a lead outright.
+- **PII.** Full transcripts are kept locally so you can drill into a conversation in the dashboard, but the **emailed** report is redacted (`redact_email: true`) so customer phone numbers, emails and addresses don't end up in an inbox.
+- **Email failure is not run failure.** If SMTP is unconfigured or rejects the message, the report is still generated, stored and viewable in the dashboard.
+
+> Microsoft 365 disables SMTP AUTH by default on most tenants. If sending fails with a 535, a tenant admin must enable SMTP AUTH for the sending mailbox and you must use an app password -- no code change will work around it.
 
 ## Connecting to your platform
 

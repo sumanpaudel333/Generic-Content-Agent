@@ -10,6 +10,7 @@ business:
   service_regions: ["Region 1", "Region 2", "Region 3"]
   phone_display: ""   # e.g. "(02) 5555 0100" -- leave blank to omit from generated copy
   phone_tel: ""        # e.g. "+61255550100" -- digits only, used in tel: links
+  heading_color: "#1e3a8a"   # hex color for section headings (Features, Applications, Delivery) in generated copy
 
 # Some product catalogs have a category that legally or operationally needs
 # a standard disclaimer attached (e.g. mixed-to-order materials with a
@@ -55,6 +56,10 @@ pipeline:
   daily_batch_size: 10
   daily_run_delay_seconds: 1.0
   thin_content_char_threshold: 300
+  # false = always pull new products from the fallback export file, even
+  # if Odoo is configured (useful while working through an initial
+  # backlog import from another system). true = pull live from Odoo.
+  use_odoo_as_product_source: false
 
 # Reviewer-facing behavior in the dashboard (dashboard/app.py). Change these
 # to fit how your team wants to work the queue without touching code.
@@ -63,3 +68,31 @@ approval_flow:
   require_reject_reason: false    # true = reviewer must type a reason to reject
   page_size: 25                   # rows per page on Pending/Needs Retry/History
   min_overview_length: 15         # drafts with a shorter overview are treated as low confidence
+  regenerate_temperature: 0.8     # retries use a higher temperature so they don't just
+                                   # reproduce the draft that was already rejected
+  regenerate_escalate_first: false # true = retries go straight to the stronger model
+
+# Weekly Chatbase conversation analysis, emailed to a manager. Optional --
+# set enabled: false if you have no chatbot to analyse.
+# Secrets live in .env: CHATBASE_API_KEY, SMTP_USERNAME, SMTP_PASSWORD.
+chat_insights:
+  enabled: false
+  chatbase_agent_id: ""       # agent id -- NOT the API key. List them with:
+                              #   python -m chat_insights.weekly_run --list-agents
+  api_base: "https://www.chatbase.co/api/v1"   # v1 has the conversations; v2 returns empty
+  lookback_days: 7
+  # v1 filters by date server-side; these just bound the paging.
+  page_size: 100              # v1 accepts up to 100 per page
+  max_pages: 50
+  request_delay_seconds: 0.2  # API allows 100 requests / 10s
+  # A GENERAL model -- not a model fine-tuned for product copy. Size this to
+  # your hardware: 3B suits a CPU-only host, 7-8B needs more RAM and time.
+  model: "llama3.2:3b"
+  temperature: 0.2
+  max_analysis_tokens: 400
+  min_user_messages_for_analysis: 1
+  redact_email: true          # keep full transcripts locally, redact the email
+  report_recipients: []
+  smtp_host: "smtp.office365.com"
+  smtp_port: 587
+  smtp_from: ""

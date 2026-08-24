@@ -8,6 +8,7 @@ Uses the same JSON contract as small_model_client.py so Stage 4
 import json
 import logging
 import os
+
 import requests
 
 from config import settings

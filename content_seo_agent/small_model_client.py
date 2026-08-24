@@ -8,6 +8,7 @@ can make an escalation decision without re-deriving that logic.
 """
 import json
 import logging
+
 import requests
 
 from config import settings
@@ -19,7 +20,10 @@ MODEL_NAME = settings.SMALL_MODEL_NAME
 REQUEST_TIMEOUT_SECONDS = 60
 
 
-def _call_ollama(system_prompt: str, user_prompt: str) -> dict:
+DEFAULT_TEMPERATURE = 0.3
+
+
+def _call_ollama(system_prompt: str, user_prompt: str, temperature: float | None = None) -> dict:
     """Low-level call to Ollama's chat endpoint. Returns the raw response dict."""
     payload = {
         "model": MODEL_NAME,
@@ -28,7 +32,7 @@ def _call_ollama(system_prompt: str, user_prompt: str) -> dict:
             {"role": "user", "content": user_prompt},
         ],
         "stream": False,
-        "options": {"temperature": 0.3},
+        "options": {"temperature": DEFAULT_TEMPERATURE if temperature is None else temperature},
     }
     resp = requests.post(OLLAMA_URL, json=payload, timeout=REQUEST_TIMEOUT_SECONDS)
     resp.raise_for_status()
@@ -102,14 +106,19 @@ def classify(title: str, description: str = "") -> dict:
     return {"parsed": parsed, "parse_success": success, "raw_text": raw_text, "error": None}
 
 
-def draft(title: str) -> dict:
+def draft(title: str, temperature: float | None = None) -> dict:
     """
     Runs the drafting task. Same return shape as classify().
+
+    temperature: overrides the default. Regeneration passes a higher value --
+    at the default 0.3 a re-run on the same title tends to reproduce almost
+    exactly the draft a reviewer just rejected, which defeats the point of
+    retrying.
     """
     user_prompt = f"Product title: {title}"
 
     try:
-        response = _call_ollama(settings.SYSTEM_DRAFT, user_prompt)
+        response = _call_ollama(settings.SYSTEM_DRAFT, user_prompt, temperature=temperature)
         raw_text = response.get("message", {}).get("content", "")
     except requests.RequestException as e:
         logger.error("Ollama draft call failed: %s", e)
