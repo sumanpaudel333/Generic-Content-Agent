@@ -163,8 +163,10 @@ def render_report(stats: dict, week_start: str, week_end: str, *, redacted: bool
     footer_note = (
         f'Generated automatically from Chatbase conversations. '
         f'{_esc(model_note)} '
-        + ("Customer contact details have been removed from this email; full transcripts "
-            "are available in the dashboard." if redacted else "")
+        + ("Customer contact details have been removed from this email. Full, unredacted "
+            "transcripts are in the Automation Control dashboard, under Chat Insights -- "
+            "open the week's report and follow the Transcripts link."
+            if redacted else "")
     )
 
     return f"""<!DOCTYPE html>

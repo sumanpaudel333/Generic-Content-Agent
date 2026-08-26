@@ -90,6 +90,19 @@ THIN_CONTENT_CHAR_THRESHOLD = int(_pipeline_cfg.get("thin_content_char_threshold
 USE_ODOO_AS_PRODUCT_SOURCE = bool(_pipeline_cfg.get("use_odoo_as_product_source", False))
 
 # ---------------------------------------------------------------------------
+# Escalation chain
+#
+# The fine-tuned small model runs first. When its output is low confidence the
+# work moves up the chain: a general local model, then Claude. Either hop can
+# be switched off; with both off, low-confidence output still reaches the
+# review queue, marked low so a human sees it -- nothing is ever dropped.
+# ---------------------------------------------------------------------------
+_escalation_cfg = _cfg.get("escalation", {}) or {}
+ESCALATION_USE_FALLBACK_MODEL = bool(_escalation_cfg.get("use_fallback_model", True))
+ESCALATION_FALLBACK_MODEL_NAME = str(_escalation_cfg.get("fallback_model_name", "") or "")
+ESCALATION_USE_CLAUDE = bool(_escalation_cfg.get("use_claude", True))
+
+# ---------------------------------------------------------------------------
 # Approval flow (reviewer dashboard behavior)
 # ---------------------------------------------------------------------------
 _approval_cfg = _cfg.get("approval_flow", {}) or {}
@@ -117,9 +130,15 @@ CHAT_MAX_ANALYSIS_TOKENS = int(_chat_cfg.get("max_analysis_tokens", 400))
 CHAT_MIN_USER_MESSAGES = int(_chat_cfg.get("min_user_messages_for_analysis", 1))
 CHAT_REDACT_EMAIL = bool(_chat_cfg.get("redact_email", True))
 CHAT_REPORT_RECIPIENTS = list(_chat_cfg.get("report_recipients", []) or [])
+# SMTP defaults. Every one of these is overridden by the matching .env key
+# (SMTP_HOST / SMTP_PORT / SMTP_SECURITY / SMTP_FROM) -- see chat_insights.mailer.
 CHAT_SMTP_HOST = str(_chat_cfg.get("smtp_host", "") or "")
 CHAT_SMTP_PORT = int(_chat_cfg.get("smtp_port", 587))
+CHAT_SMTP_SECURITY = str(_chat_cfg.get("smtp_security", "") or "")
 CHAT_SMTP_FROM = str(_chat_cfg.get("smtp_from", "") or "")
+CHAT_SMTP_FROM_NAME = str(_chat_cfg.get("smtp_from_name", "") or "")
+CHAT_SMTP_TLS_CA_FILE = str(_chat_cfg.get("smtp_tls_ca_file", "") or "")
+CHAT_SMTP_TLS_VERIFY = bool(_chat_cfg.get("smtp_tls_verify", True))
 
 # ---------------------------------------------------------------------------
 # Derived: system prompts

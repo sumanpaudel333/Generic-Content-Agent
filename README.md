@@ -149,8 +149,18 @@ DASHBOARD_ADMIN_PASSWORD=
 
 # Chat Insights (optional) -- weekly Chatbase analysis emailed to a manager.
 CHATBASE_API_KEY=
+# Any SMTP relay. SMTP_SECURITY: starttls (587) | ssl (465) | none;
+# blank infers from the port. Leave username/password blank for an
+# unauthenticated relay.
+SMTP_HOST=
+SMTP_PORT=587
+SMTP_SECURITY=
+SMTP_TLS_CA_FILE=           # PEM cert of a relay with a self-signed certificate
+SMTP_TLS_VERIFY=true        # false = encrypt without verifying the certificate
 SMTP_USERNAME=
 SMTP_PASSWORD=
+SMTP_FROM=
+SMTP_RECIPIENTS=            # comma-separated
 
 # Odoo Online -- ODOO_ENV picks which URL below is active. Defaults to
 # "staging" if left blank, so it can never accidentally point at live.
@@ -243,7 +253,7 @@ Setup (all under `chat_insights:` in `config.yaml`, secrets in `.env`):
    ```
    and put it in `chatbase_agent_id`. The agent id is **not** the API key -- they are different values, and pasting the key into both is an easy mistake to make.
 2. **A general local model** -- `ollama pull llama3.2:3b`. This must NOT be the fine-tuned content model: that one is trained to emit product-description JSON and cannot summarise a conversation. Size it to your hardware; 3B suits a CPU-only host, larger models need more RAM and considerably more time.
-3. **SMTP** -- `smtp_host`/`smtp_from`/`report_recipients` in config, `SMTP_USERNAME`/`SMTP_PASSWORD` in `.env`.
+3. **SMTP** -- mail server details go in `.env`: `SMTP_HOST`, `SMTP_PORT`, `SMTP_SECURITY`, `SMTP_USERNAME`, `SMTP_PASSWORD`, `SMTP_FROM` (the address the report is sent from) and `SMTP_RECIPIENTS` (who it goes to, comma-separated). Any relay works -- Microsoft 365, Google Workspace, your host's mail server or an internal relay. The `smtp_*` and `report_recipients` keys in config are fallbacks only; whatever is set in `.env` wins.
 
 Design notes worth knowing:
 
@@ -251,10 +261,81 @@ Design notes worth knowing:
 - **This uses Chatbase's v1 API, not v2.** v2 (`/api/v2/agents/{id}/conversations`) returns an empty list for these agents; v1 (`/api/v1/get-conversations`) has the actual conversations *and* supports server-side `startDate`/`endDate`. The exact `[start, end)` boundary is still enforced on timestamps locally, because v1's date filter is whole-day and its inclusivity is undocumented.
 - **A wrong agent id fails silently.** Chatbase answers an unknown agent with `200` and an empty list rather than a 404, so a misconfiguration looks exactly like "no chats this week". Use `--list-agents` to confirm, and check the conversation count on the first run.
 - **v1 exposes no per-message feedback**, so thumbs-down cannot be read from the API. Unhappy customers are inferred from sentiment plus the failure heuristics. v1 does provide `min_score` (retrieval confidence) and `form_submission`, both of which are used -- a submitted contact form counts as a lead outright.
-- **PII.** Full transcripts are kept locally so you can drill into a conversation in the dashboard, but the **emailed** report is redacted (`redact_email: true`) so customer phone numbers, emails and addresses don't end up in an inbox.
-- **Email failure is not run failure.** If SMTP is unconfigured or rejects the message, the report is still generated, stored and viewable in the dashboard.
+- **PII.** Full transcripts are kept locally so you can drill into a conversation in the dashboard, but the **emailed** report is redacted (`redact_email: true`) so customer phone numbers, emails and addresses don't end up in an inbox. The drill-down is the **Transcripts** link on the report page and in the Past reports list: every conversation in the week with its topic, category, sentiment and lead/bot-failure flags, and from there the full unredacted message-by-message transcript. That page is what the emailed report's footer points at.
+- **Email failure is not run failure.** If SMTP is unconfigured or rejects the message, the report is still generated, stored and viewable in the dashboard. Every stored report has a **Send by email** button (on the report page and in the Past reports list) that sends it on demand -- for a week whose scheduled send failed, or one run with `--no-email`. The manual send re-renders the body from the stored stats, so it is redacted exactly like the scheduled one.
+- **SMTP AUTH is optional.** Credentials are only used if both `SMTP_USERNAME` and `SMTP_PASSWORD` are set *and* the server advertises the AUTH extension. An internal relay (say `192.168.0.4:25` with `SMTP_SECURITY=none`) accepts mail without them.
+- **Self-signed certificates.** An internal relay's certificate won't verify against the system trust store (`CERTIFICATE_VERIFY_FAILED: self-signed certificate`). Point `SMTP_TLS_CA_FILE` at the relay's certificate in PEM form to keep the connection verified, or set `SMTP_TLS_VERIFY=false` to encrypt without verifying -- defensible for a relay on your own LAN, since it still stops a passive eavesdropper, but not someone who can impersonate the relay. `SMTP_SECURITY=none` skips TLS altogether and is the weaker option of the two.
 
-> Microsoft 365 disables SMTP AUTH by default on most tenants. If sending fails with a 535, a tenant admin must enable SMTP AUTH for the sending mailbox and you must use an app password -- no code change will work around it.
+> If you do use Microsoft 365, note that it disables SMTP AUTH by default on most tenants. If sending fails with a 535, a tenant admin must enable SMTP AUTH for the sending mailbox and you must use an app password -- no code change will work around it. Other providers are unaffected.
+
+## Scheduled jobs
+
+`scripts/register_scheduled_tasks.ps1`, run once from an **elevated** PowerShell,
+registers four Windows tasks: the daily content job, the weekly chat job, and
+at-boot services for the dashboard and Ollama. The services are not optional
+extras -- Ollama ships as a per-user Startup shortcut that only runs while
+someone is logged in, so without one the scheduled jobs wake to no local model.
+
+Re-running the script is how you change a schedule; it replaces the tasks
+wholesale. `-LogonType` decides how they authenticate:
+
+- **S4U** (default) -- no stored password, but needs "Log on as a batch job" and
+  domain policy that permits it.
+- **Password** -- prompts once via `Get-Credential`. Use this when S4U is blocked.
+- **System** -- runs as SYSTEM. Fine for the jobs; not for Ollama, whose models
+  live in the user profile.
+
+**When a task does nothing at all** -- `LastTaskResult` stays `267011`, no log
+file appears -- the job never started, so there is nothing wrong with the
+application. Task Scheduler keeps that story in its own log:
+
+```powershell
+Get-WinEvent -LogName 'Microsoft-Windows-TaskScheduler/Operational' -MaxEvents 200 |
+  Where-Object { $_.Message -like '*BCSands*' } | Select-Object TimeCreated, Id, Message | Format-List
+```
+
+Event 104 naming `LogonUserS4U` with error `2147943726` (`0x8007052E`) means the
+logon was refused: re-register with `-LogonType Password`.
+
+Once tasks do run, their output is in `logs/` and readable in the dashboard at
+**Settings -> Job logs** (admin only), so checking on a job does not need an RDP
+session.
+
+## Escalation chain
+
+Content generation runs up three rungs. A rung is only reached when the one
+before it produced low-confidence output -- JSON that did not parse, missing
+fields, or a safety flag on an unverified compliance claim:
+
+| Rung | What it is | Cost |
+|---|---|---|
+| Fine-tuned model | `models.small_model_name`, trained on your own product data | free, fastest |
+| Fallback model | `escalation.fallback_model_name`, a general local model | free, slower |
+| Claude | `models.claude_model` via the Anthropic API | an API call per escalation |
+
+```yaml
+escalation:
+  use_fallback_model: true
+  fallback_model_name: "llama3.2:3b"
+  use_claude: true
+```
+
+Both hops are optional. Turn one off and the chain simply stops there --
+whatever the last rung produced still lands in the review queue **marked low
+confidence**, so a human sees it. Switching escalation off costs quality, never
+a lost draft. With `use_claude: false` the pipeline never makes an API call and
+needs no `ANTHROPIC_API_KEY`.
+
+Which rung produced a row is stored on it and shown as a badge in the queue
+(Local model / Fallback model / Claude), and it is a filter in the review queue,
+so the value of each rung is measurable rather than assumed. The Content Agent
+page shows the chain's live state -- a fallback model that is enabled but never
+pulled reports as unavailable rather than failing silently at draft time.
+
+Retries of a rejected draft use the same chain.
+`approval_flow.regenerate_escalate_first` skips the first rung on retries only:
+if a reviewer rejected that model's output once, starting a rung higher is
+usually the faster route to something publishable.
 
 ## Connecting to your platform
 

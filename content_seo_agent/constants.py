@@ -22,7 +22,16 @@ class TaskType:
 
 
 class Source:
+    # Which model produced the row, i.e. how far up the escalation chain the
+    # work had to travel: fine-tuned model -> general local model -> Claude.
     SMALL_MODEL = "small_model"
+    FALLBACK_MODEL = "fallback_model"
     CLAUDE = "claude"
 
-    ALL = {SMALL_MODEL, CLAUDE}
+    ALL = {SMALL_MODEL, FALLBACK_MODEL, CLAUDE}
+
+    LABELS = {
+        SMALL_MODEL: "Local model",
+        FALLBACK_MODEL: "Fallback model",
+        CLAUDE: "Claude",
+    }

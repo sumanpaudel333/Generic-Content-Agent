@@ -120,9 +120,12 @@ def process_dataframe(df: pd.DataFrame, limit: int | None, target_statuses: set,
     Returns the results summary dict.
     """
     if not small_model_available():
-        print("WARNING: small model (Ollama) is not reachable. Every product in this "
-              "run will escalate straight to Claude, which is slower and costs more. "
-              "Check Ollama is running before continuing a large batch.")
+        print("WARNING: Ollama is not reachable, so neither local rung of the escalation "
+              "chain can run. Every product in this run escalates straight to Claude, "
+              "which is slower and costs more per product. Check Ollama is running "
+              "before continuing a large batch.")
+    for label, ok, detail in pipeline.escalation_status():
+        print(f"  [{'ok' if ok else '--'}] {label}: {detail}")
 
     df = df.copy()
     df["content_status"] = df.apply(
@@ -163,8 +166,11 @@ def process_dataframe(df: pd.DataFrame, limit: int | None, target_statuses: set,
         try:
             draft_row = pipeline.process_drafting(product_id, title)
             results["processed"] += 1
-            if draft_row.get("source") == Source.CLAUDE:
+            if draft_row.get("source") != Source.SMALL_MODEL:
                 results["escalated"] += 1
+                results.setdefault("by_source", {})
+                results["by_source"][draft_row["source"]] = \
+                    results["by_source"].get(draft_row["source"], 0) + 1
             if draft_row.get("safety_flags"):
                 results["safety_flagged"] += 1
                 print(f"    -> flagged for review: {draft_row['safety_flags']}")
@@ -193,7 +199,9 @@ def run_batch(input_path: str, limit: int | None, target_statuses: set, delay: f
         f"Target statuses: {sorted(target_statuses)}\n"
         f"Total attempted: {results['total']}\n"
         f"Processed successfully: {results['processed']}\n"
-        f"Escalated to Claude: {results['escalated']}\n"
+        f"Escalated past the fine-tuned model: {results['escalated']}"
+        + (f" ({', '.join(f'{k}: {v}' for k, v in results.get('by_source', {}).items())})"
+           if results.get("by_source") else "") + "\n"
         f"Flagged by safety filter: {results['safety_flagged']}\n"
         f"Failed: {results['failed']}\n"
         f"Elapsed: {results.get('elapsed_seconds', 0)/60:.1f} minutes\n"

@@ -125,6 +125,35 @@ def run_weekly(*, reference: datetime | None = None, send_email: bool = True,
         return db.finish_run(run_id, status=db.STATUS_FAILED, error=str(e))
 
 
+def email_report(run_id: int) -> dict:
+    """Emails a report that already exists, for the dashboard's manual send.
+
+    The email body is re-rendered from the stored stats rather than reusing the
+    stored report_html: that copy is the unredacted one shown in the dashboard,
+    and what leaves the building must obey redact_email exactly as the scheduled
+    run does. The run's email status is updated so the history reflects the
+    resend.
+    """
+    run = db.get_run(run_id)
+    if not run:
+        return {"success": False, "detail": f"Run {run_id} does not exist."}
+    stats = run.get("stats") or {}
+    if run["status"] != db.STATUS_COMPLETE or not stats:
+        return {"success": False,
+                "detail": "This run did not complete, so there is no report to send."}
+
+    body = reporter.render_report(
+        stats, run["week_start"], run["week_end"], redacted=settings.CHAT_REDACT_EMAIL,
+        truncated=bool(run.get("truncated")),
+        model_note=f"Analysis by {settings.CHAT_MODEL} running locally.")
+    outcome = mailer.send(
+        reporter.render_subject(stats, run["week_start"], run["week_end"]), body)
+    db.set_email_result(run_id, "sent" if outcome["success"] else "failed",
+                        outcome["detail"])
+    logger.info("Manual email for run %s: %s", run_id, outcome["detail"])
+    return outcome
+
+
 def status_lines() -> list[tuple[str, bool, str]]:
     """(label, ok, detail) for each dependency -- surfaced in the dashboard so
     it is obvious what still needs configuring."""

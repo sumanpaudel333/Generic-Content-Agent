@@ -42,7 +42,8 @@ from content_seo_agent.batch_runner import process_dataframe
 from content_seo_agent.constants import Status, TaskType, Source
 from content_seo_agent.daily_run import get_current_products
 from connectors.odoo_connector import odoo_connector  # must import after load_dotenv()
-from chat_insights import db as chat_db, weekly_run as chat_run
+from chat_insights import db as chat_db, mailer, weekly_run as chat_run
+from dashboard import job_logs
 from config import settings
 from dashboard import auth, ui
 
@@ -571,8 +572,9 @@ def _filter_bar_html(active: dict, base_path: str) -> str:
         <label>Source
             <select name="source">
                 {option("", "All", source)}
-                {option(Source.SMALL_MODEL, "Local model", source)}
-                {option(Source.CLAUDE, "Claude", source)}
+                {option(Source.SMALL_MODEL, Source.LABELS[Source.SMALL_MODEL], source)}
+                {option(Source.FALLBACK_MODEL, Source.LABELS[Source.FALLBACK_MODEL], source)}
+                {option(Source.CLAUDE, Source.LABELS[Source.CLAUDE], source)}
             </select>
         </label>
         <label>Confidence
@@ -668,6 +670,32 @@ def _regen_bar_html(pending_count: int) -> str:
     </div>"""
 
 
+def _escalation_panel() -> str:
+    """What the escalation chain will actually do right now. Config alone does
+    not answer that -- a fallback model can be enabled but never pulled."""
+    rows = ""
+    for label, ok, detail in pipeline.escalation_status():
+        disabled = "disabled" in detail
+        if disabled:
+            badge = '<span class="badge planned">Off</span>'
+        elif ok:
+            badge = '<span class="badge live">Ready</span>'
+        else:
+            badge = '<span class="badge confidence-low">Unavailable</span>'
+        rows += (f'<tr><td style="width:170px"><b>{html.escape(label)}</b></td>'
+                 f'<td>{badge}</td>'
+                 f'<td class="meta">{html.escape(detail)}</td></tr>')
+    return f"""
+    <div class="panel">
+      <h2>Escalation chain</h2>
+      <p class="meta" style="margin:-4px 0 12px">Low-confidence output moves down this list
+         until a model produces something that scores as confident. Whatever the last rung
+         produced still reaches this queue, marked low confidence. Configure it in
+         <code>config.yaml</code> under <code>escalation</code>.</p>
+      <table class="grid">{rows}</table>
+    </div>"""
+
+
 def _fetch_bar_html() -> str:
     source_label = "Odoo (live)" if settings.USE_ODOO_AS_PRODUCT_SOURCE else "Backlog export file"
 
@@ -756,7 +784,8 @@ def agent_queue(request: Request):
     </div>"""
 
     query_state = {k: v for k, v in filters.items() if k != "page"}
-    inner = (f'{_fetch_bar_html()}{_filter_bar_html(filters, CONTENT_AGENT)}{bulk_bar}{cards_html}'
+    inner = (f'{_fetch_bar_html()}{_escalation_panel()}'
+             f'{_filter_bar_html(filters, CONTENT_AGENT)}{bulk_bar}{cards_html}'
              f'{_pagination_html(CONTENT_AGENT, query_state, filters["page"], total, page_size)}')
 
     subtitle = ("Approving a draft publishes it to Odoo immediately."
@@ -1180,6 +1209,22 @@ def _chat_run_bar_html() -> str:
     </div>"""
 
 
+def _chat_email_button(run: dict, label: str = "Send by email") -> str:
+    """Manual send for a report that already exists -- for a week whose
+    scheduled send failed, or one that was run without emailing."""
+    if run.get("status") != chat_db.STATUS_COMPLETE or not run.get("stats"):
+        return ""
+    if mailer.is_configured():
+        extra = f'title="Send to {html.escape(", ".join(mailer.recipients()))}"'
+    else:
+        extra = f'disabled title="{html.escape(mailer.config_status())}"'
+    resend = " again" if run.get("email_status") == "sent" else ""
+    return (f'<form method="post" action="{CHAT_INSIGHTS}/run/{run["id"]}/email" '
+            f'style="display:inline;margin:0">'
+            f'<button class="btn-ghost" type="submit" style="padding:5px 12px" {extra}>'
+            f'&#9993; {html.escape(label)}{resend}</button></form>')
+
+
 @app.get(CHAT_INSIGHTS, response_class=HTMLResponse)
 def chat_insights_home(request: Request):
     runs = chat_db.list_runs(limit=settings.APPROVAL_PAGE_SIZE)
@@ -1215,8 +1260,13 @@ def chat_insights_home(request: Request):
               <td>{status_badge}</td>
               <td>{email_badge}</td>
               <td class="meta">{html.escape(str(r.get("finished_at") or r.get("started_at") or ""))[:19]}</td>
-              <td><a class="btn-ghost" style="padding:5px 12px;text-decoration:none;border-radius:8px"
-                     href="{CHAT_INSIGHTS}/run/{r['id']}">View report</a></td>
+              <td style="white-space:nowrap">
+                  <a class="btn-ghost" style="padding:5px 12px;text-decoration:none;border-radius:8px"
+                     href="{CHAT_INSIGHTS}/run/{r['id']}">View report</a>
+                  <a class="btn-ghost" style="padding:5px 12px;text-decoration:none;border-radius:8px"
+                     href="{CHAT_INSIGHTS}/run/{r['id']}/conversations">Transcripts</a>
+                  {_chat_email_button(r, label="Email")}
+              </td>
             </tr>"""
         table = f"""
         <div class="panel"><h2>Past reports</h2>
@@ -1270,17 +1320,24 @@ def chat_insights_report(request: Request, run_id: int):
                   f'var(--line);border-radius:10px;background:#fff" title="Weekly chat report">'
                   f'</iframe>')
 
-    email_note = ""
+    status_text = "not sent yet"
+    cls = "dry-run-note"
     if run.get("email_status"):
-        cls = "dry-run-note" if run["email_status"] != "sent" else "meta"
-        email_note = (f'<div class="{cls}">Email: {html.escape(run["email_status"])} -- '
-                       f'{html.escape(run.get("email_detail") or "")}</div>')
+        status_text = html.escape(run["email_status"])
+        if run.get("email_detail"):
+            status_text += f' -- {html.escape(run["email_detail"])}'
+        cls = "meta" if run["email_status"] == "sent" else "dry-run-note"
+    email_note = (f'<div class="{cls}" style="display:flex;gap:12px;align-items:center;'
+                   f'flex-wrap:wrap"><span>Email: {status_text}</span>'
+                   f'{_chat_email_button(run)}</div>')
 
     body = f"""
     <div class="page-head">
       <div>
         <h1>Week of {html.escape(run["week_start"])}</h1>
-        <p class="subtitle">{run.get("conversation_count", 0)} conversations
+        <p class="subtitle">
+           <a href="{CHAT_INSIGHTS}/run/{run_id}/conversations">{run.get("conversation_count", 0)}
+           conversations</a>
            &middot; {html.escape(run["week_start"])} to {html.escape(run["week_end"])}
            &middot; <a href="{CHAT_INSIGHTS}">back to all reports</a></p>
       </div>
@@ -1291,6 +1348,172 @@ def chat_insights_report(request: Request, run_id: int):
     return ui.page_shell(body, title=f"Chat report {run['week_start']} · Automation Control",
                           active_module="chat-insights", user=_current_user(request),
                           request=request)
+
+
+def _sentiment_badge(analysis: dict) -> str:
+    """Sentiment as a badge, reusing the confidence colours: this is the same
+    good/bad signal a reviewer is already scanning for elsewhere."""
+    sentiment = (analysis.get("sentiment") or "").lower()
+    cls = {"negative": "confidence-low", "positive": "confidence-high"}.get(sentiment, "planned")
+    return f'<span class="badge {cls}">{html.escape(sentiment or "unrated")}</span>'
+
+
+@app.get(CHAT_INSIGHTS + "/run/{run_id}/conversations", response_class=HTMLResponse)
+def chat_insights_conversations(request: Request, run_id: int):
+    """Every conversation in a run, with what the analysis made of it.
+
+    This is the drill-down the emailed report points at: the email is redacted,
+    so anyone who needs the customer's actual words comes here for them.
+    """
+    run = chat_db.get_run(run_id)
+    if not run:
+        return HTMLResponse(ui.page_shell(
+            ui.empty_state("Report not found", "That run does not exist."),
+            title="Chat Insights", active_module="chat-insights",
+            user=_current_user(request), request=request), status_code=404)
+
+    conversations = chat_db.list_conversations(run_id)
+    analyses = {a["conversation_id"]: a for a in chat_db.list_analyses(run_id)}
+
+    rows = ""
+    for c in conversations:
+        a = analyses.get(c["id"], {})
+        flags = ""
+        if a.get("bot_failed"):
+            flags += ' <span class="badge confidence-low">bot could not answer</span>'
+        if a.get("is_lead"):
+            flags += ' <span class="badge live">lead</span>'
+        if c.get("negative_feedback"):
+            flags += ' <span class="badge confidence-low">thumbs down</span>'
+        when = datetime.fromtimestamp(int(c["created_at"] or 0), timezone.utc).strftime("%Y-%m-%d %H:%M")
+        rows += f"""
+        <tr>
+          <td class="meta" style="white-space:nowrap">{html.escape(when)}</td>
+          <td><b>{html.escape(a.get("topic") or "--")}</b>{flags}
+              <div class="meta">{html.escape(a.get("summary") or "")}</div></td>
+          <td>{html.escape(a.get("category") or "--")}</td>
+          <td>{_sentiment_badge(a)}</td>
+          <td class="meta">{c.get("message_count", 0)}</td>
+          <td><a class="btn-ghost" style="padding:5px 12px;text-decoration:none;border-radius:8px"
+                 href="{CHAT_INSIGHTS}/conversation/{html.escape(c["id"])}">Transcript</a></td>
+        </tr>"""
+
+    if conversations:
+        table = f"""
+        <div class="panel"><h2>Conversations</h2>
+          <table class="grid">
+            <tr><th>When</th><th>Topic</th><th>Category</th><th>Sentiment</th>
+                <th>Messages</th><th></th></tr>
+            {rows}
+          </table>
+        </div>"""
+    else:
+        table = ui.empty_state("No conversations stored",
+                                "This run recorded no conversations for the week.")
+
+    body = f"""
+    <div class="page-head">
+      <div>
+        <h1>Conversations, week of {html.escape(run["week_start"])}</h1>
+        <p class="subtitle">{len(conversations)} conversations
+           &middot; <a href="{CHAT_INSIGHTS}/run/{run_id}">back to the report</a></p>
+      </div>
+    </div>
+    <div class="dry-run-note">Full transcripts, unredacted. The emailed report has customer
+       contact details stripped out; this page is where they are kept.</div>
+    {table}
+    """
+    return ui.page_shell(body, title=f"Conversations {run['week_start']} · Automation Control",
+                          active_module="chat-insights", user=_current_user(request),
+                          request=request)
+
+
+@app.get(CHAT_INSIGHTS + "/conversation/{conversation_id}", response_class=HTMLResponse)
+def chat_insights_conversation(request: Request, conversation_id: str):
+    """One conversation, message by message, with its analysis alongside."""
+    conv = chat_db.get_conversation(conversation_id)
+    if not conv:
+        return HTMLResponse(ui.page_shell(
+            ui.empty_state("Conversation not found",
+                            "It may belong to a run whose data has since been cleared."),
+            title="Chat Insights", active_module="chat-insights",
+            user=_current_user(request), request=request), status_code=404)
+
+    analysis = chat_db.get_analysis(conversation_id) or {}
+
+    messages = ""
+    for m in conv["messages"]:
+        role = "user" if (m.get("role") or "").lower() == "user" else "assistant"
+        who = "Customer" if role == "user" else "Bot"
+        # Chatbase records a thumbs down against the message it was given on,
+        # so mark that message rather than only the conversation.
+        flagged = " flagged" if (m.get("feedback") or "").lower() in ("negative", "thumbs_down") else ""
+        messages += (f'<div class="chat-msg {role}{flagged}"><span class="who">{who}</span>'
+                     f'{html.escape(m.get("text") or "")}</div>')
+    if not messages:
+        messages = '<div class="meta">No messages were stored for this conversation.</div>'
+
+    summary_rows = ""
+    for label, value in (("Topic", analysis.get("topic")),
+                          ("Category", analysis.get("category")),
+                          ("Summary", analysis.get("summary")),
+                          ("Lead detail", analysis.get("lead_detail")),
+                          ("Why it counts as a bot failure", analysis.get("failure_reason"))):
+        if value:
+            summary_rows += (f'<tr><td class="meta" style="white-space:nowrap">{label}</td>'
+                             f'<td>{html.escape(str(value))}</td></tr>')
+
+    badges = _sentiment_badge(analysis)
+    if analysis.get("is_lead"):
+        badges += ' <span class="badge live">lead</span>'
+    if analysis.get("bot_failed"):
+        badges += ' <span class="badge confidence-low">bot could not answer</span>'
+    if analysis.get("resolved"):
+        badges += ' <span class="badge confidence-high">resolved</span>'
+    if not analysis:
+        badges = ('<span class="badge planned">not analysed</span>'
+                  ' <span class="meta">too few messages to be worth a generation</span>')
+
+    when = datetime.fromtimestamp(int(conv.get("created_at") or 0), timezone.utc)
+    back = (f'{CHAT_INSIGHTS}/run/{conv["run_id"]}/conversations' if conv.get("run_id")
+            else CHAT_INSIGHTS)
+
+    body = f"""
+    <div class="page-head">
+      <div>
+        <h1>{html.escape(analysis.get("topic") or "Conversation")}</h1>
+        <p class="subtitle">{when:%Y-%m-%d %H:%M} UTC &middot;
+           {html.escape(conv.get("source") or "unknown source")} &middot;
+           {conv.get("message_count", 0)} messages &middot;
+           <a href="{back}">back to the conversation list</a></p>
+      </div>
+    </div>
+    <div class="panel">
+      <div style="margin-bottom:10px">{badges}</div>
+      {f'<table class="grid">{summary_rows}</table>' if summary_rows else ''}
+    </div>
+    <div class="panel">
+      <h2>Transcript</h2>
+      <div class="transcript">{messages}</div>
+    </div>
+    """
+    return ui.page_shell(body, title="Conversation · Automation Control",
+                          active_module="chat-insights", user=_current_user(request),
+                          request=request)
+
+
+@app.post(CHAT_INSIGHTS + "/run/{run_id}/email")
+def chat_insights_email(run_id: int):
+    """Sends an already-generated report on demand. Synchronous on purpose: one
+    small message, and the whole point of the button is to see whether the mail
+    server accepted it."""
+    back = f"{CHAT_INSIGHTS}/run/{run_id}"
+    if not mailer.is_configured():
+        return _redirect(back, err=mailer.config_status())
+    outcome = chat_run.email_report(run_id)
+    if outcome["success"]:
+        return _redirect(back, msg=outcome["detail"])
+    return _redirect(back, err=outcome["detail"])
 
 
 @app.post(CHAT_INSIGHTS + "/run")
@@ -1315,6 +1538,97 @@ def chat_insights_run(background_tasks: BackgroundTasks, send_email: str = Form(
 
 def _require_admin(request: Request) -> bool:
     return _current_user(request).get("role") == auth.ROLE_ADMIN
+
+
+@app.get("/settings/jobs", response_class=HTMLResponse)
+def settings_jobs(request: Request, log: str = "", lines: int = job_logs.DEFAULT_TAIL_LINES):
+    """What the scheduled jobs actually did, without an RDP session.
+
+    Admin-only: these logs carry customer questions from the chat analysis and
+    the full text of anything that failed, which is more than a reviewer needs.
+    """
+    user = _current_user(request)
+    if not _require_admin(request):
+        return HTMLResponse(ui.page_shell(
+            ui.empty_state("Admins only", "You need an admin account to view job logs."),
+            title="Job logs", active_module="settings", user=user, request=request),
+            status_code=403)
+
+    entries = job_logs.catalogue()
+    selected = log if log in job_logs.CATALOGUE else ""
+    # Default to the newest log that actually exists, so the page opens on
+    # something useful rather than an empty pane.
+    if not selected:
+        written = [e for e in entries if e["exists"]]
+        if written:
+            selected = max(written, key=lambda e: e["modified"])["key"]
+
+    rows = ""
+    for e in entries:
+        if e["exists"]:
+            size = f'{e["size"]/1024:.1f} KB' if e["size"] >= 1024 else f'{e["size"]} bytes'
+            state = f'<span class="badge live">written</span>'
+            when = e["modified"].strftime("%Y-%m-%d %H:%M UTC")
+        else:
+            size, when = "--", "--"
+            state = '<span class="badge planned">never written</span>'
+        active = ' style="background:var(--blue-100)"' if e["key"] == selected else ""
+        rows += f"""
+        <tr{active}>
+          <td><b>{html.escape(e["label"])}</b>
+              <div class="meta">{html.escape(e["written_by"])}</div></td>
+          <td>{state}</td>
+          <td class="meta">{size}</td>
+          <td class="meta">{html.escape(when)}</td>
+          <td><a class="btn-ghost" style="padding:5px 12px;text-decoration:none;border-radius:8px"
+                 href="/settings/jobs?log={e["key"]}&lines={lines}">View</a></td>
+        </tr>"""
+
+    viewer = ""
+    if selected:
+        label = job_logs.CATALOGUE[selected][0]
+        result = job_logs.tail(selected, lines)
+        if result["missing"]:
+            viewer = ui.empty_state(
+                f"{label}: no log file yet",
+                "The task that writes it has not run successfully. Check Windows Task "
+                "Scheduler -- a task that fails to start never writes a line.")
+        else:
+            note = ('<span class="meta">showing the end of the file only</span>'
+                    if result["truncated"] else "")
+            body_text = html.escape(result["text"]) or "(the file is empty)"
+            viewer = f"""
+            <div class="panel">
+              <div class="card-header" style="margin-bottom:10px">
+                <h2>{html.escape(label)} <span class="meta">last {lines} lines</span></h2>
+                <div style="display:flex;gap:8px;align-items:center">
+                  {note}
+                  <a class="btn-ghost" style="padding:5px 12px;text-decoration:none;border-radius:8px"
+                     href="/settings/jobs?log={selected}&lines={min(lines * 5, job_logs.MAX_TAIL_LINES)}">More lines</a>
+                  <a class="btn-ghost" style="padding:5px 12px;text-decoration:none;border-radius:8px"
+                     href="/settings/jobs?log={selected}&lines={lines}">Refresh</a>
+                </div>
+              </div>
+              <pre class="logview">{body_text}</pre>
+            </div>"""
+
+    body = f"""
+    <div class="page-head">
+      <div><h1>Job logs</h1>
+      <p class="subtitle">Output from the scheduled tasks. A job that never wrote a log
+         never started -- that is a Task Scheduler problem, not an application one.</p></div>
+    </div>
+    <div class="panel">
+      <h2>Logs</h2>
+      <table class="grid">
+        <tr><th>Job</th><th>State</th><th>Size</th><th>Last written</th><th></th></tr>
+        {rows}
+      </table>
+    </div>
+    {viewer}
+    """
+    return ui.page_shell(body, title="Job logs · Automation Control",
+                          active_module="settings", user=user, request=request)
 
 
 @app.get("/settings/users", response_class=HTMLResponse)

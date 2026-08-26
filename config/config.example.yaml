@@ -52,6 +52,28 @@ models:
   ollama_url: "http://127.0.0.1:11434/api/chat"
   claude_model: "claude-sonnet-4-6"
 
+# ---------------------------------------------------------------------------
+# Escalation chain for content generation.
+#
+# The fine-tuned small model always runs first. If its output is low confidence
+# (bad JSON, missing fields, an unverified compliance claim) the same task is
+# retried further up the chain:
+#
+#   fine-tuned model  ->  fallback_model_name  ->  Claude
+#
+# Turn either hop off and the chain stops there. Whatever the last model
+# produced still goes to the review queue marked low confidence -- switching
+# these off costs quality, never a lost draft.
+#
+# The fallback is a general local model (free, slower than the fine-tuned one,
+# no API call). Claude costs an API call per escalation and needs
+# ANTHROPIC_API_KEY in .env.
+# ---------------------------------------------------------------------------
+escalation:
+  use_fallback_model: true
+  fallback_model_name: "llama3.2:3b"   # any tag `ollama list` shows
+  use_claude: true
+
 pipeline:
   daily_batch_size: 10
   daily_run_delay_seconds: 1.0
@@ -74,7 +96,10 @@ approval_flow:
 
 # Weekly Chatbase conversation analysis, emailed to a manager. Optional --
 # set enabled: false if you have no chatbot to analyse.
-# Secrets live in .env: CHATBASE_API_KEY, SMTP_USERNAME, SMTP_PASSWORD.
+# Secrets and mail server details live in .env: CHATBASE_API_KEY, SMTP_HOST,
+# SMTP_PORT, SMTP_SECURITY, SMTP_USERNAME, SMTP_PASSWORD, SMTP_FROM, SMTP_FROM_NAME,
+# SMTP_RECIPIENTS,
+# SMTP_TLS_CA_FILE, SMTP_TLS_VERIFY.
 chat_insights:
   enabled: false
   chatbase_agent_id: ""       # agent id -- NOT the API key. List them with:
@@ -92,7 +117,21 @@ chat_insights:
   max_analysis_tokens: 400
   min_user_messages_for_analysis: 1
   redact_email: true          # keep full transcripts locally, redact the email
+  # Fallback recipients. SMTP_RECIPIENTS in .env (comma-separated) wins.
   report_recipients: []
-  smtp_host: "smtp.office365.com"
+
+  # Mail server defaults. The details actually used live in .env (SMTP_HOST,
+  # SMTP_PORT, SMTP_SECURITY, SMTP_USERNAME, SMTP_PASSWORD, SMTP_FROM); anything
+  # set there wins over the values below, which exist only so a deployment
+  # without those keys still has something to fall back on.
+  # smtp_security: starttls (587) | ssl (465) | none. Blank = infer from port.
+  smtp_host: ""
   smtp_port: 587
+  smtp_security: ""
   smtp_from: ""
+  smtp_from_name: ""      # display name, e.g. "Chatbase-Insight"
+  # A relay with a self-signed certificate: point smtp_tls_ca_file at its
+  # certificate (PEM) to keep verification, or set smtp_tls_verify to false to
+  # encrypt without verifying. Overridden by SMTP_TLS_CA_FILE / SMTP_TLS_VERIFY.
+  smtp_tls_ca_file: ""
+  smtp_tls_verify: true

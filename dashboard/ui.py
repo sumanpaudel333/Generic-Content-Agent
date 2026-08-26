@@ -164,6 +164,7 @@ h2 { font-size:16px; margin:0 0 12px; }
 .badge { display:inline-block; font-size:10.5px; padding:2.5px 9px; border-radius:999px;
          font-weight:600; letter-spacing:.2px; }
 .badge.small_model { background:var(--blue-100); color:var(--blue-700); }
+.badge.fallback_model { background:#E7F3EC; color:#166534; }
 .badge.claude { background:#EDE7F9; color:#5B21B6; }
 .badge.classify { background:#EEF2F7; color:#475569; }
 .badge.draft { background:var(--yellow-100); color:var(--yellow-600); }
@@ -181,6 +182,22 @@ h2 { font-size:16px; margin:0 0 12px; }
 .dry-run-note { background:var(--amber-bg); border:1px solid var(--yellow-300); border-left:3px solid var(--yellow-500);
                 border-radius:8px; padding:9px 12px; margin-top:9px; font-size:12.5px; color:var(--amber); }
 .meta { font-size:12px; color:var(--muted); }
+.logview { background:#0F172A; color:#E2E8F0; border-radius:8px; padding:14px 16px;
+           font-family:Consolas,'Courier New',monospace; font-size:12px; line-height:1.5;
+           max-height:560px; overflow:auto; white-space:pre; margin:0; }
+
+/* Chat transcript drill-down. Two columns of bubbles so who said what is
+   readable at a glance without any per-message labels. */
+.transcript { display:flex; flex-direction:column; gap:10px; }
+.chat-msg { max-width:78%; padding:10px 13px; border-radius:12px; font-size:13px;
+            line-height:1.55; white-space:pre-wrap; overflow-wrap:anywhere; }
+.chat-msg.user { align-self:flex-end; background:var(--blue-100); color:var(--blue-700);
+                 border-bottom-right-radius:3px; }
+.chat-msg.assistant { align-self:flex-start; background:#F4F5F7; color:var(--ink);
+                      border-bottom-left-radius:3px; }
+.chat-msg .who { display:block; font-size:10.5px; text-transform:uppercase;
+                 letter-spacing:.04em; opacity:.7; margin-bottom:3px; }
+.chat-msg.flagged { box-shadow:0 0 0 2px var(--red); }
 .empty { color:var(--muted); text-align:center; padding:48px 20px; background:var(--card);
          border:1px dashed var(--line); border-radius:var(--radius); }
 .empty-title { font-weight:600; color:var(--ink); margin-bottom:5px; font-size:14px; }
@@ -388,8 +405,9 @@ def _nav_html(active_module: str, user: dict | None) -> str:
         for i in NAV_ITEMS
     )
     if user and user.get("role") == "admin":
-        links += (f'<a href="/settings/users" class="{"active" if active_module == "settings" else ""}">'
-                   f'Settings</a>')
+        active = "active" if active_module == "settings" else ""
+        links += (f'<a href="/settings/users" class="{active}">Settings</a>'
+                   f'<a href="/settings/jobs" class="{active}">Job logs</a>')
 
     user_block = ""
     if user:

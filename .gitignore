@@ -4,6 +4,10 @@ config/config.yaml
 # Secrets
 .env
 
+# Fetched mail-relay certificate -- environment-specific, refetch with
+# python -m scripts.fetch_smtp_cert
+config/smtp_relay_cert.pem
+
 # Python
 venv/
 __pycache__/

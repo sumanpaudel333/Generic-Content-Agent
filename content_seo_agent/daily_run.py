@@ -107,7 +107,7 @@ if __name__ == "__main__":
         f"Batch size limit: {DAILY_BATCH_SIZE}\n"
         f"Total attempted: {results['total']}\n"
         f"Processed successfully: {results['processed']}\n"
-        f"Escalated to Claude: {results['escalated']}\n"
+        f"Escalated past the fine-tuned model: {results['escalated']}\n"
         f"Flagged by safety filter: {results['safety_flagged']}\n"
         f"Failed: {results['failed']}\n"
         f"Elapsed: {results.get('elapsed_seconds', 0)/60:.1f} minutes\n"
