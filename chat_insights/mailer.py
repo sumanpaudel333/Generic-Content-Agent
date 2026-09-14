@@ -7,15 +7,22 @@ non-secret ones), so any SMTP relay works -- Microsoft 365, Google Workspace,
 a hosting provider's mail server, SendGrid/Mailgun, or an internal relay.
 
   .env keys        SMTP_HOST, SMTP_PORT, SMTP_SECURITY, SMTP_USERNAME,
-                   SMTP_PASSWORD, SMTP_FROM, SMTP_FROM_NAME, SMTP_RECIPIENTS,
+                   SMTP_PASSWORD, SMTP_FROM, SMTP_FROM_NAME,
                    SMTP_TLS_CA_FILE, SMTP_TLS_VERIFY
   config.yaml      chat_insights.smtp_host / smtp_port / smtp_security /
-                   smtp_from / smtp_from_name / report_recipients /
-                   smtp_tls_ca_file / smtp_tls_verify  (used only when the
-                   matching .env key is unset)
+                   smtp_from / smtp_from_name / smtp_tls_ca_file /
+                   smtp_tls_verify  (used only when the matching .env key
+                   is unset)
 
-SMTP_RECIPIENTS is a comma-separated list ("a@x.com, b@x.com"), so who the
-report goes to can be changed without touching config.yaml.
+Recipients are NOT set here. They are per mailing -- see MAIL_PURPOSES below --
+because the sales team wants the lead list and nothing else, while whoever
+babysits the server wants the job failures and nothing else. A single
+SMTP_RECIPIENTS could not express that: it overrode everything, so all three
+mailings went to the same people and pointing one somewhere else meant moving
+the others too. It is no longer read. Each mailing has its own list under
+email.recipients in config.yaml, overridable per mailing from .env with
+REPORT_RECIPIENTS, LEADS_RECIPIENTS, LEAD_ALERT_RECIPIENTS and
+JOB_FAILURE_RECIPIENTS -- each a comma-separated list.
 
 SMTP_SECURITY is one of:
   starttls  plain connection upgraded to TLS (the usual choice on port 587)
@@ -129,32 +136,98 @@ def sender_name() -> str:
     return parseaddr(_env("SMTP_FROM", settings.CHAT_SMTP_FROM))[0]
 
 
-def from_header() -> str:
-    """RFC 5322 From value -- "Chatbase-Insight <chat@bcsands.com.au>". Quoting
-    of a name containing commas or other specials is formataddr's job."""
-    name = sender_name()
-    return formataddr((name, sender())) if name else sender()
+def from_header(name: str | None = None) -> str:
+    """RFC 5322 From value -- "Chatbot-Insight <chat@bcsands.com.au>". Quoting
+    of a name containing commas or other specials is formataddr's job.
+
+    `name` overrides the configured display name for one message. The address
+    is deliberately NOT overridable here: relays generally only accept mail
+    from addresses they are configured for, so changing it per-message is a
+    good way to have mail silently refused. What a password email needs is to
+    stop looking like it came from the chat report, and the display name is
+    what a recipient actually reads.
+    """
+    display = sender_name() if name is None else name
+    return formataddr((display, sender())) if display else sender()
+
+
+# Every mailing this system sends, and where its address list comes from.
+#
+# One list per job, and no shared default. A single SMTP_RECIPIENTS driving
+# everything meant the weekly analysis, the lead call-list and the job-failure
+# alerts all went to the same people, and pointing one of them somewhere else
+# was not possible without redirecting the others too. The sales team wants the
+# leads and nothing else; whoever babysits the server wants the failures and
+# nothing else.
+#
+# Nothing falls back to anything. A job with no addresses configured sends no
+# mail and says so -- which is the honest outcome, and far better than quietly
+# mailing a list that was never meant to receive it.
+MAIL_PURPOSES = {
+    "weekly_report": ("weekly chat report", "REPORT_RECIPIENTS"),
+    "daily_leads": ("daily lead digest", "LEADS_RECIPIENTS"),
+    "lead_alerts": ("instant lead alerts", "LEAD_ALERT_RECIPIENTS"),
+    "job_failures": ("job failure alerts", "JOB_FAILURE_RECIPIENTS"),
+}
+
+
+def _split(raw: str) -> list[str]:
+    return [address.strip() for address in (raw or "").split(",") if address.strip()]
+
+
+def recipients_for(purpose: str) -> list[str]:
+    """Addresses for one job. Empty means "do not send this mailing".
+
+    .env wins over config.yaml, matching how every other setting here resolves.
+    """
+    if purpose not in MAIL_PURPOSES:
+        raise ValueError(f"unknown mail purpose {purpose!r}")
+    _label, env_key = MAIL_PURPOSES[purpose]
+    from_env = _split(_env(env_key))
+    if from_env:
+        return from_env
+    return list(settings.MAIL_RECIPIENTS.get(purpose) or [])
+
+
+def purpose_label(purpose: str) -> str:
+    return MAIL_PURPOSES.get(purpose, (purpose, ""))[0]
+
+
+def missing_recipients_detail(purpose: str) -> str:
+    _label, env_key = MAIL_PURPOSES.get(purpose, ("", ""))
+    return (f"No recipients configured for the {purpose_label(purpose)}, so nothing was "
+            f"sent. Set email.recipients.{purpose} in config.yaml, or {env_key} in .env.")
 
 
 def recipients() -> list[str]:
-    """Who the report goes to. SMTP_RECIPIENTS (comma-separated) wins over
-    chat_insights.report_recipients."""
-    raw = _env("SMTP_RECIPIENTS")
-    if raw:
-        return [address.strip() for address in raw.split(",") if address.strip()]
-    return list(settings.CHAT_REPORT_RECIPIENTS)
+    """Deprecated: the weekly report's list.
+
+    Kept so nothing calling it breaks, but there is no such thing as "the"
+    recipients any more -- ask for the mailing you mean with recipients_for().
+    """
+    return recipients_for("weekly_report")
 
 
 def is_configured() -> bool:
+    """Whether the mail SERVER is usable. Says nothing about whether any given
+    job has somewhere to send -- that is is_configured_for()."""
     return not _missing()
 
 
+def is_configured_for(purpose: str) -> bool:
+    return is_configured() and bool(recipients_for(purpose))
+
+
 def _missing() -> list[str]:
+    """What stops this server from sending at all.
+
+    Recipients are deliberately not checked here. They are per job now, so a
+    missing lead list is not a broken mail server -- it is one mailing switched
+    off, and reporting it as "email not configured" would hide a real fault.
+    """
     missing = []
     if not host():
         missing.append("SMTP_HOST (.env) or chat_insights.smtp_host")
-    if not recipients():
-        missing.append("SMTP_RECIPIENTS (.env) or chat_insights.report_recipients")
     if not sender():
         missing.append("SMTP_FROM (.env) or chat_insights.smtp_from")
     # Half a credential pair is a misconfiguration, not an unauthenticated relay.
@@ -167,18 +240,32 @@ def _missing() -> list[str]:
 
 def config_status() -> str:
     missing = _missing()
-    if not missing:
-        auth = "authenticated" if uses_auth() else "no auth"
-        tls = ""
-        if security() != "none":
-            if not tls_verify():
-                tls = ", cert NOT verified"
-            elif tls_ca_file():
-                tls = f", cert verified against {os.path.basename(tls_ca_file())}"
-        return (f"Email: configured ({from_header()} -> "
-                f"{', '.join(recipients())} via "
-                f"{host()}:{port()} {security()}{tls}, {auth})")
-    return "Email: not configured -- missing " + ", ".join(missing)
+    if missing:
+        return "Email: not configured -- missing " + ", ".join(missing)
+    auth = "authenticated" if uses_auth() else "no auth"
+    tls = ""
+    if security() != "none":
+        if not tls_verify():
+            tls = ", cert NOT verified"
+        elif tls_ca_file():
+            tls = f", cert verified against {os.path.basename(tls_ca_file())}"
+    lines = [f"Email: server ready ({from_header()} via {host()}:{port()} "
+             f"{security()}{tls}, {auth})"]
+    for purpose, (label, _env_key) in MAIL_PURPOSES.items():
+        who = recipients_for(purpose)
+        lines.append(f"  {label}: " + (", ".join(who) if who else "no recipients -- not sent"))
+    return "\n".join(lines)
+
+
+def config_status_for(purpose: str) -> str:
+    """One line about one mailing, for a status table or a disabled button."""
+    missing = _missing()
+    if missing:
+        return "Email: not configured -- missing " + ", ".join(missing)
+    who = recipients_for(purpose)
+    if not who:
+        return missing_recipients_detail(purpose)
+    return f"{purpose_label(purpose).capitalize()} goes to {', '.join(who)}"
 
 
 def _ssl_context() -> ssl.SSLContext:
@@ -217,26 +304,67 @@ def _connect():
     return server
 
 
-def send(subject: str, html_body: str, *, to_addresses: list[str] | None = None,
-         smtp_factory=None) -> dict:
+def send(subject: str, html_body: str, *, purpose: str = "",
+         to_addresses: list[str] | None = None,
+         text_body: str = "", from_name: str | None = None,
+         inline_images: dict | None = None, smtp_factory=None) -> dict:
     """Sends the report. Returns {"success": bool, "detail": str}.
+
+    `text_body` is the plain-text alternative. Passing the real report rather
+    than a "your client cannot show this" stub matters for more than old mail
+    clients: the text part is what mail search indexes, and what gets quoted
+    when somebody forwards the report with a question on top.
+
+    `purpose` names which mailing this is, and its address list is looked up
+    from that -- see MAIL_PURPOSES. Pass `to_addresses` to override it outright.
+
+    With neither, nothing is sent. There is no shared default list to fall back
+    on by design: a mailing with nobody configured is one somebody chose not to
+    switch on, and guessing an address for it would send the sales team's call
+    list to whoever happened to be first in some other setting.
+
+    `from_name` changes the display name on this one message. Used by the
+    account emails, which must not arrive looking like the chat report.
+
+    `inline_images` is {content_id: bytes} attached to the HTML part and
+    referenced as <img src="cid:content_id">. Embedded rather than linked
+    because a linked image needs the dashboard to be reachable from wherever
+    the mail is read, and most clients refuse to load remote images anyway --
+    which would leave a broken box where the logo should be.
 
     `smtp_factory` is injectable so tests exercise the whole path without
     touching a real mail server."""
-    to_addresses = to_addresses or recipients()
+    if to_addresses is None and purpose:
+        to_addresses = recipients_for(purpose)
+    to_addresses = [a for a in (to_addresses or []) if a]
+    if not to_addresses:
+        detail = (missing_recipients_detail(purpose) if purpose in MAIL_PURPOSES
+                   else "No recipients given, so nothing was sent.")
+        logger.info("%s", detail)
+        return {"success": False, "detail": detail, "skipped": True}
     if not is_configured():
         return {"success": False, "detail": config_status()}
 
     message = EmailMessage()
     message["Subject"] = subject
-    message["From"] = from_header()
+    message["From"] = from_header(from_name)
     message["To"] = ", ".join(to_addresses)
-    message.set_content(
-        "This report is formatted in HTML. If you are reading this, your mail client "
-        "could not display it -- the same report is available in the Automation Control "
-        "dashboard under Chat Insights."
-    )
+    message.set_content(text_body or (
+        "This message is formatted in HTML. If you are reading this, your mail client "
+        "could not display it -- the same content is in the Content and Automation "
+        "dashboard."
+    ))
     message.add_alternative(html_body, subtype="html")
+
+    if inline_images:
+        # The image rides on the HTML part, not the message root, so a client
+        # showing the plain-text alternative does not list it as an attachment.
+        html_part = message.get_payload()[-1]
+        for cid, data in inline_images.items():
+            if not data:
+                continue
+            html_part.add_related(data, maintype="image", subtype="png",
+                                   cid=f"<{cid}>", filename=f"{cid}.png")
 
     try:
         if smtp_factory is not None:

@@ -47,6 +47,46 @@ def build_fixed_tail_html(is_regulated: bool) -> str:
     return "\n\n".join(parts)
 
 
+# Extra reviewer-authored sections, beyond Features and Applications. Some
+# products need a heading those two do not cover -- Technical Details,
+# Coverage, Care Instructions -- and hard-coding a third fixed heading would
+# only move the problem, because the next product needs a fourth.
+#
+# Shape: [{"heading": str, "items": [str, ...]}]. Rendered with the same bullet
+# list as the built-in sections, so a custom section is indistinguishable from
+# a native one in the published copy.
+MAX_SECTIONS = 6
+MAX_HEADING_LENGTH = 60
+
+
+def normalise_sections(raw) -> list[dict]:
+    """Cleans arbitrary input into storable sections.
+
+    Applied on the way in AND on the way out. A draft written before sections
+    existed, or one whose JSON was hand-edited, can carry anything at all, and
+    the assembler must not be the place that discovers a heading is a dict. A
+    section with a heading but no items is dropped rather than published as an
+    empty bullet list.
+    """
+    out = []
+    for entry in (raw or [])[:MAX_SECTIONS]:
+        if not isinstance(entry, dict):
+            continue
+        heading = str(entry.get("heading") or "").strip()[:MAX_HEADING_LENGTH]
+        items = [str(i).strip() for i in (entry.get("items") or []) if str(i).strip()]
+        if heading and items:
+            out.append({"heading": heading, "items": items})
+    return out
+
+
+def build_section_html(heading: str, items: list[str]) -> str:
+    """One heading and its bullet list, styled exactly like Features."""
+    heading_style = settings.heading_style_attr()
+    bullets = "\n".join("  <li>" + _esc(i) + "</li>" for i in items)
+    return ("<p><b" + heading_style + ">" + _esc(heading) + ":</b></p>\n"
+            "<ul>\n" + bullets + "\n</ul>")
+
+
 def build_editable_parts_html(draft_json: dict, is_regulated: bool, ratio: str, quantity_detail: str) -> str:
     """The model-controlled portion of the final HTML -- overview,
     features (with the mix-line prepended when applicable), and
@@ -72,6 +112,11 @@ def build_editable_parts_html(draft_json: dict, is_regulated: bool, ratio: str, 
         app_items = "\n".join(f"  <li>{a}</li>" for a in applications)
         parts.append(f"<p><b{heading_style}>Applications:</b></p>\n<ul>\n{app_items}\n</ul>")
 
+    # Reviewer-added sections come after the two standard ones, and before the
+    # fixed delivery/disclaimer tail that assemble_html appends.
+    for section in normalise_sections(draft_json.get("sections")):
+        parts.append(build_section_html(section["heading"], section["items"]))
+
     return "\n\n".join(parts)
 
 
@@ -85,7 +130,8 @@ def assemble_html(
     """
     Builds the final product description HTML from a structured draft.
 
-    draft_json: {"overview": str, "features": [str, ...], "applications": [str, ...]}
+    draft_json: {"overview": str, "features": [str, ...], "applications": [str, ...],
+                 "sections": [{"heading": str, "items": [str, ...]}, ...]}
     is_regulated / ratio / quantity_detail: from title_parser.py,
         NOT from the model -- these are the verified, code-extracted facts.
     """

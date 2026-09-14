@@ -181,7 +181,32 @@ def process_drafting(product_id, title: str) -> dict:
     return row
 
 
-def regenerate_draft_for_row(row_id: int) -> dict | None:
+def available_models() -> list[dict]:
+    """The rungs a reviewer can pick from when regenerating, with whether each
+    one can actually run right now.
+
+    Built from escalation_status() rather than from config, because "enabled in
+    config.yaml" and "will produce a draft if you press this" are different
+    claims -- a fallback model that was never pulled is the obvious case.
+    """
+    status = {label: (ok, detail) for label, ok, detail in escalation_status()}
+    rungs = [
+        (Source.SMALL_MODEL, "Fine-tuned model", "Fine-tuned model"),
+        (Source.FALLBACK_MODEL, "Fallback model", "Fallback model"),
+        (Source.CLAUDE, "Claude", "Claude escalation"),
+    ]
+    out = []
+    for key, label, status_key in rungs:
+        ok, detail = status.get(status_key, (False, "unknown"))
+        # "disabled" reads as available in escalation_status -- it means the
+        # chain is correctly configured to skip it -- but it is not something a
+        # reviewer can choose to run.
+        usable = ok and "disabled" not in detail
+        out.append({"key": key, "label": label, "available": usable, "detail": detail})
+    return out
+
+
+def regenerate_draft_for_row(row_id: int, model: str = "") -> dict | None:
     """Generates a fresh draft for a row that was already reviewed (typically
     rejected) and puts it back in the queue.
 
@@ -200,6 +225,14 @@ def regenerate_draft_for_row(row_id: int) -> dict | None:
     rung is often the faster route to something publishable. If escalation is
     switched off entirely there is nothing stronger to skip to, so the
     fine-tuned model runs anyway, at the higher temperature.
+
+    `model` pins the retry to one rung (a Source value) instead of walking the
+    chain. A reviewer looking at a rejected draft usually knows which model to
+    reach for -- they have just read what the last one produced -- and guessing
+    costs a minute of generation per product. Pinned means pinned: the run does
+    NOT escalate past it, because "use Claude" that quietly falls back to the
+    model whose output was already rejected is not what was asked for. The
+    output still lands in the queue whatever its confidence, marked as always.
     """
     row = review_queue.get_row(row_id)
     if not row:
@@ -225,18 +258,27 @@ def regenerate_draft_for_row(row_id: int) -> dict | None:
     # The rejection note is grounding for every rung, not just Claude -- a
     # retry that stops at the fallback model should still know what the
     # reviewer objected to.
-    chain = _build_chain(
-        lambda: small_model_client.draft(title, temperature=settings.REGENERATE_TEMPERATURE,
-                                         extra_context=context),
-        lambda: small_model_client.draft(title, temperature=settings.REGENERATE_TEMPERATURE,
-                                         model=settings.ESCALATION_FALLBACK_MODEL_NAME,
-                                         extra_context=context),
-        lambda: claude_client.draft(title, extra_context=context),
-    )
-    if settings.REGENERATE_ESCALATE_FIRST and len(chain) > 1:
-        # Straight past the model whose output was already rejected once.
-        chain = chain[1:]
-        _log_run(product_id, "regenerate", "escalated_first_to_" + chain[0][0], rejection_note)
+    calls = {
+        Source.SMALL_MODEL: lambda: small_model_client.draft(
+            title, temperature=settings.REGENERATE_TEMPERATURE, extra_context=context),
+        Source.FALLBACK_MODEL: lambda: small_model_client.draft(
+            title, temperature=settings.REGENERATE_TEMPERATURE,
+            model=settings.ESCALATION_FALLBACK_MODEL_NAME, extra_context=context),
+        Source.CLAUDE: lambda: claude_client.draft(title, extra_context=context),
+    }
+
+    if model and model in calls:
+        # One rung, no escalation. See the docstring: a pinned choice that
+        # silently falls back is worse than one that fails visibly.
+        chain = [(model, calls[model])]
+        _log_run(product_id, "regenerate", "pinned_to_" + model, rejection_note)
+    else:
+        chain = _build_chain(calls[Source.SMALL_MODEL], calls[Source.FALLBACK_MODEL],
+                              calls[Source.CLAUDE])
+        if settings.REGENERATE_ESCALATE_FIRST and len(chain) > 1:
+            # Straight past the model whose output was already rejected once.
+            chain = chain[1:]
+            _log_run(product_id, "regenerate", "escalated_first_to_" + chain[0][0], rejection_note)
 
     result, conf, source, ok = _run_chain(product_id, "regenerate", chain, score)
     if not ok:
