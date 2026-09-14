@@ -84,6 +84,7 @@ content_seo_agent/
   safety_filter.py        Catches unverified claims and quantity mismatches
   confidence.py           Decides small-model-output vs escalate
   db.py / review_queue.py SQLite-backed review queue
+  product_images.py       Reviewer-uploaded photos: staging, publish, verify, cleanup
   assembler.py            Assembles the final HTML, injecting code-only content
   pipeline.py             Ties it all together for a single product
   batch_runner.py         CLI batch processor with resume + rate limiting
@@ -93,16 +94,22 @@ chat_insights/
   db.py                   SQLite store for runs, conversations and analyses
   redact.py               Strips customer PII from the emailed report
   llm.py                  General local model client (not the fine-tuned one)
-  analyzer.py             Deterministic stats + per-conversation model pass
+  analyzer.py             Deterministic stats, keywords + per-conversation model pass
+  handoff.py              Did the bot really forward the lead, or only say so?
+  leads.py                Contact extraction and lead records
+  lead_report.py          The daily lead email
+  daily_leads.py          The daily lead job
   reporter.py             Renders the HTML report
   mailer.py               Sends it (stdlib smtplib)
   weekly_run.py           The weekly job
 scripts/
-  register_scheduled_tasks.ps1  Registers both scheduled jobs in Task Scheduler
+  register_scheduled_tasks.ps1  Registers the scheduled jobs in Task Scheduler
+  reclaim_images.py             Verifies published images, then reclaims staged copies
 dashboard/
-  app.py                  Automation Control Dashboard -- routes for each module
+  app.py                  Content and Automation Dashboard -- routes for each module
   auth.py                 Login, sessions, users (PBKDF2 hashes, stdlib only)
-  ui.py                   Theme, page shell, module registry (add new tabs here)
+  ui.py                   Theme, page shell, breadcrumbs, module registry (add new tabs here)
+  job_logs.py             Read side of the scheduled tasks' log files
 training/
   prepare_training_data.py  Builds fine-tuning JSONL from your catalog export
   fine_tune_model.ipynb     Colab notebook: LoRA fine-tune + GGUF export
@@ -204,9 +211,68 @@ python -m uvicorn dashboard.app:app --host 0.0.0.0 --port 8420
 ```
 Visit `http://localhost:8420`.
 
-**Signing in.** The dashboard requires a login. On first run it seeds an admin account from `DASHBOARD_ADMIN_USER`/`DASHBOARD_ADMIN_PASSWORD` in `.env`; if no password is set there, a random one is generated and **printed to the server console once** at startup -- copy it before the terminal scrolls. After that, users are managed in-app under **Settings -> Users** (admins can add users, reset passwords, and disable accounts). Passwords are stored as salted PBKDF2-HMAC-SHA256 hashes in `logs/dashboard_auth.db`, separate from the review queue database.
+**Signing in.** The dashboard requires a login. On first run it seeds an admin account from `DASHBOARD_ADMIN_USER`/`DASHBOARD_ADMIN_PASSWORD` in `.env`; if no password is set there, a random one is generated and **printed to the server console once** at startup -- copy it before the terminal scrolls. After that, accounts are managed in-app under **Administration -> People**. Passwords are stored as salted PBKDF2-HMAC-SHA256 hashes in `logs/dashboard_auth.db`, separate from the review queue database.
 
-**Layout.** The dashboard is an *Automation Control* shell with one top-level tab per automation. **Content Agent** is the first: its Review queue / Needs retry / History tabs are the human checkpoint described above. To add another automation, register it in `MODULES` in `dashboard/ui.py` and add its routes in `dashboard/app.py` -- navigation, theming, and auth come from the shell.
+**Nobody has to hand out a password.** Adding somebody with an email address emails them a link to choose their own; an admin only types a password for somebody who has no email address at all. The same link, sent to somebody who has signed in before, is a password reset -- and there is a **Forgotten your password?** link on the sign-in page so they do not have to ask.
+
+The link mechanism is one thing doing both jobs, and it is built to the same rule as the passwords beside it: **the token is generated once, shown once, and never stored.** Only its SHA-256 is kept, so a copy of the database is a pile of hashes rather than a set of working keys. Each link works once, and issuing a new one kills the old, so pressing "send" twice cannot leave two ways in. An invitation lasts seven days because the person may not be at their desk today; a reset lasts two hours because they asked for it a minute ago and are waiting.
+
+**The account emails do not come from the chat report.** They arrive as **BC Sands Content and Automation Dashboard**, not as *Chatbot-Insight*. A message asking somebody to set a password has to look like it came from the thing they are setting a password for; arriving under the name of the weekly chat report is confusing, and it is the exact shape of an email people are trained to distrust. Only the display name is overridden per message -- the address stays as configured, because relays generally only accept mail from addresses they know about. Set `ACCOUNT_EMAIL_FROM_NAME` in `.env` to change it.
+
+Both emails carry the BC Sands logo in a brand header, **embedded rather than linked**. A linked image needs the dashboard to be reachable from wherever the mail is read, and most clients refuse to load remote images anyway, which would leave a broken box where the logo should be. It rides on the HTML part as a `cid:` reference, so a client showing the plain-text alternative does not list it as an attachment. Everything is tables, inline styles and `bgcolor`: Outlook renders through Word, which ignores flexbox, most of the box model and `border-radius`, so the button is a table cell with a background colour rather than a styled link.
+
+**Addresses carry no personal detail.** After an action, the page you land on is just its own address -- `/settings/users`, not `/settings/users?msg=Deleted+jsmith...`. The one-line message ("Published", "Deleted jsmith") is stored on the server, and the browser holds only a random id for it in a cookie, used once and gone within ten minutes. The old way put the text in the URL, which leaked names, email addresses and once a live sign-in link into browser history, IIS's request log and the Referer header of the next site visited -- and an Odoo error long enough took the page down outright, because IIS refuses query strings over 2,048 bytes. A server-side reference is also stronger than encrypting the text into the URL: an encrypted value is still long, still logged, and readable by whoever holds the key. Error messages now stay on screen until dismissed; only success messages fade.
+
+The password-reset link is the one place a secret has to arrive in a URL, because that is the only way an email can deliver it. It leaves again straight away: the token is moved into a cookie scoped to the set-password page and the browser is redirected to the bare `/set-password`. That page is also marked not to be cached and to send no Referer. Every other page sends Referer only within the dashboard.
+
+**Changing `.env` needs a restart.** Settings are read once, when the dashboard starts. An Odoo database name corrected in `.env` changes nothing while the old process is running -- publishing keeps failing against the old name. Admins now see a warning on the overview and the Content Agent pages listing exactly what differs between `.env` and what is running (a changed login or API key is reported as changed, never by value). If the dashboard was started by hand rather than by its scheduled task, the task can show "Ready" while the old process still holds port 8420; restart by stopping whatever owns the port:
+
+```powershell
+Stop-Process -Id (Get-NetTCPConnection -LocalPort 8420 -State Listen).OwningProcess -Force
+Start-ScheduledTask -TaskName 'BCSands-Dashboard'
+```
+
+**Signing in takes either a username or an email address.** People remember one or the other, and being told "wrong username" when you typed a perfectly good email address is a poor way to spend somebody's afternoon. The username is tried first, so it stays authoritative if an account's username ever looks like somebody else's address. The failure message is the same either way, for the same reason `authenticate()` does not say which half was wrong.
+
+**Deleting an account** is on each card, below its own line, and asks for the username to be typed as well as confirmed. Everything else on that card can be undone by pressing the opposite button; this cannot, and the cards sit close together. It removes the account, its sessions and any pending link, and frees the username. It does **not** remove what the person did: the activity log stores their name as text in a different database, so their approvals and rejections stay readable, which is the point of an activity log. Turning off access is usually the better move and keeps the username reserved. The last active admin cannot be deleted, and nobody can delete themselves.
+
+Three details worth knowing:
+
+- **Setting a password signs that account out everywhere** -- except when you change your own, where being logged out of the tab you just used would read as the change having failed. The reason the others do is the case this exists for: somebody asks for a reset because they think a colleague has their password, and leaving that colleague's session alive would make the reset pointless.
+- **The forgotten-password form always says the same thing**, whether or not the address belongs to an account. Otherwise it becomes a way to find out who works here.
+- **If email is not set up, or the server does not know its own web address, the link is shown on screen instead** for the admin to pass on. An invitation that silently fails to send leaves an account nobody can use and nobody knows about.
+
+The People page is a card per person rather than a table row: a name, an email address and a role are things you edit, and editing three text boxes in a table means either a modal or a separate page. Each card also says where that person is up to -- invited but not signed in yet, never signed in, or last seen on a date -- which a "never" in a Last sign-in column does not distinguish. The last active admin cannot be demoted or disabled, and nobody can change their own role.
+
+**Layout.** The dashboard is the *Content and Automation Dashboard*: a left sidebar listing every automation, with the work filling the rest of the window. **Content Agent** is the first: its To check / Did not send / Turned down / Done tabs are the human checkpoint described above. To add another automation, register it in `MODULES` in `dashboard/ui.py` (label, path, icon and a one-line description) and add its routes in `dashboard/app.py` -- navigation, theming, and auth come from the shell.
+
+**Two roles, and what separates them.** A **reviewer** reviews: they read the queue, edit a description, approve it, turn it down, send it to the product, ask for one item to be written again, and work the lead list. An **admin** does all of that plus everything else.
+
+What a reviewer cannot do is start a job or send mail:
+
+| | Reviewer | Admin |
+|---|---|---|
+| Approve, turn down, edit, publish | yes | yes |
+| Rewrite a single description | yes | yes |
+| Fetch a batch of new products | no | yes |
+| Rewrite every turned-down description | no | yes |
+| Run the weekly chat analysis | no | yes |
+| Email a report, send the morning lead list | no | yes |
+| Check for leads | yes | yes |
+| Read chat transcripts | yes | yes |
+| See which lead emails went out | no | yes |
+| See the Setup read-out on Chat Insights | no | yes |
+| People, job history, activity log, photo storage | no | yes |
+
+The line is drawn at actions that reach outside the dashboard and cannot be taken back. A batch run ties up the machine for as long as it takes and cannot be stopped from a browser; an email is gone the moment the relay accepts it. All of those also have scheduled counterparts, so a reviewer pressing one is usually repeating work that already happened overnight rather than fixing anything. Rewriting *one* description stays with the reviewer, because that is the recourse for a bad draft in front of them, not a batch.
+
+**Checking for leads is split rather than blocked.** The scan only re-reads chats already stored here and updates a list on the same page, so anyone may run it. The part that leaves the building -- the alert email for a lead nobody has seen yet -- runs only for somebody who may send mail, and the confirmation dialog only promises it to them. Nothing is lost by the split: a lead that goes un-alerted stays un-alerted, so the next admin scan or the overnight job still sends it. Transcripts are readable by everyone; they are the context behind a lead, and a reviewer following one up needs to see what the customer actually said.
+
+The permissions live in one table, `PERMISSIONS` in `dashboard/auth.py`, so moving a capability between roles is a single edit and a test can assert the whole matrix rather than hunting for the route that forgot. Controls a reviewer cannot use are hidden from their pages, but **the hiding is a courtesy, not the permission** -- every one of those routes checks for itself, because a hidden form still posts to a URL anyone signed in can type. A refused attempt is written to the activity log.
+
+**Navigation is a sidebar, not a row of tabs.** The tab strip had grown to seven entries, which wrapped onto a second line on a laptop and pushed the page content down. Vertical gives each entry room for an icon and a readable label, keeps every section visible at once, and groups the admin pages under their own heading. Below 980px it collapses into a drawer, since a permanent column costs too much of a phone screen.
+
+**The pages are written for the people who use them, not the people who built them.** No model names, no config file paths, no scheduled-task internals: a reviewer reads "Descriptions waiting to be checked", not "pending rows in the review queue". Where a name is genuinely needed to fix something -- the scheduled task to look for, the setting that is missing -- it still appears, but only on the admin pages and only when something is actually wrong. Two display maps do the translating (`WRITER_LABELS` and `CHAT_SETUP_LABELS` in `dashboard/app.py`) so the command-line tools keep the detailed vocabulary that suits a terminal.
 
 > The dashboard has no transport encryption of its own. On anything beyond a trusted LAN, put it behind a reverse proxy terminating HTTPS -- session cookies would otherwise travel in the clear.
 
@@ -233,11 +299,61 @@ On Windows, register both scheduled jobs at once from an **elevated** PowerShell
 .\scripts\register_scheduled_tasks.ps1
 ```
 
-That creates `BCSands-ContentAgent-Daily` (02:00 daily) and `BCSands-ChatInsights-Weekly` (03:00 Mondays), each logging to `logs/`. Override with `-DailyAt`, `-WeeklyAt`, `-WeeklyOn`. Check with `Get-ScheduledTask -TaskName 'BCSands-*'`.
+That registers the jobs and the at-boot services, each logging to `logs/`. Override the times with `-DailyAt`, `-WeeklyAt`, `-WeeklyOn`, `-ReclaimImagesAt`.
+
+To see what is actually scheduled -- day, time, last result and next run:
+
+```powershell
+.\scripts\job_status.ps1
+```
+
+Do not trust this README (or your memory) for the schedule: read it off the task. Add `-History` to see which recent runs fired **on schedule** versus which somebody started by hand.
 
 ## Chat Insights (optional module)
 
-A second automation: once a week it pulls your Chatbase conversations, works out what happened in them, and emails a manager a report covering **questions the bot could not answer**, what customers asked about, likely sales leads, volume, and anyone who left negative feedback.
+A second automation: once a week it pulls your Chatbase conversations, works out what happened in them, and emails a manager a report.
+
+The report is ordered for someone reading top-down in an inbox:
+
+1. **The numbers**, with movement against last week -- conversations, resolution rate, leads, unanswered, plus messages, busiest day, sentiment split and channel.
+2. **Popular keywords** -- what customers actually typed, and how many of those conversations the bot could not help with.
+3. **Why the bot could not answer** -- the failures split by what would fix them.
+4. **What customers asked about**, then **volume by day**.
+5. **Unhappy customers**.
+
+### Why the bot could not answer
+
+"17 unanswered" is one number covering three problems owned by three different people, so it is split by the fix rather than listed by instance:
+
+| Kind | Means | Fix |
+|---|---|---|
+| Nothing on the site covers it | The bot said it did not have the answer | Write the page |
+| Answered from a page too thin to match | Retrieval found something barely relevant | Add the missing detail to the page |
+| Told the customer to phone instead | It had the answer and chose not to give it | Bot configuration, not content |
+
+Derived from the stored failure reason, so it works on weeks that were analysed before this existed -- no re-run needed. The section is hidden on a week with no failures.
+
+### Drafting what customers are asking about
+
+The two automations now talk to each other in one direction. Chat Insights knows which products customers ask about and which of those the bot could not answer; the content agent drafts ten products a day out of a backlog, and used to take them in whatever order the export happened to list. A product nobody had mentioned in months got written before one three customers asked about last week.
+
+`chat_insights/demand.py` turns the stored weekly keywords into a weight per term -- a term the bot **failed** on counts three times one it answered, because a question we could not answer is a page that is missing. `batch_runner` sorts its queue by how well each product title matches, and prints what it promoted and why:
+
+```
+Ordering by what customers asked about (7 term(s) from Chat Insights):
+  [  8] Soil Organic Garden Mix Australian Standard AS4419 Bulk Bag  <- soil, mix
+  [  6] Mulch Wood Chip Red 1m3 Bulk Bag                             <- mulch
+```
+
+Three things keep this safe:
+
+- **It only ever reorders.** Nothing is added or dropped, every product still gets drafted, and ties keep the source order. With no matching demand the queue is exactly what it was.
+- **The content pipeline does not import the chat side.** The terms are passed in by whichever job started the batch, through `content_seo_agent/demand_link.py`. If Chat Insights is missing, unconfigured, has never run or throws, the caller passes `{}` and the order is unchanged.
+- **Matching is on whole words.** `sand` does not score `Sandstone` and `mix` does not score `Mixed`; a multi-word term has to appear as a phrase. Generic terms that would flatten the ranking rather than sharpen it (`delivery`, `price`, `bag`, `tonne`) are excluded.
+
+**Two lists used to be here and are not any more.** The per-lead list moved out entirely: leads are a worklist, they go to sales every morning in their own email, and repeating them weekly to a different audience made them look like something to read rather than something to action. The unanswered-questions list came out with it -- the keyword table already carries that signal in aggregate (`delivery: 7 conversations, 7 of them unanswered`), which says what to fix rather than listing every instance of it.
+
+The **counts** for both stay in the headline tiles. They are the week's numbers, and that is what this report is for.
 
 ```bash
 python -m chat_insights.weekly_run --dry-run                    # show config status and the target window
@@ -253,10 +369,46 @@ Setup (all under `chat_insights:` in `config.yaml`, secrets in `.env`):
    ```
    and put it in `chatbase_agent_id`. The agent id is **not** the API key -- they are different values, and pasting the key into both is an easy mistake to make.
 2. **A general local model** -- `ollama pull llama3.2:3b`. This must NOT be the fine-tuned content model: that one is trained to emit product-description JSON and cannot summarise a conversation. Size it to your hardware; 3B suits a CPU-only host, larger models need more RAM and considerably more time.
-3. **SMTP** -- mail server details go in `.env`: `SMTP_HOST`, `SMTP_PORT`, `SMTP_SECURITY`, `SMTP_USERNAME`, `SMTP_PASSWORD`, `SMTP_FROM` (the address the report is sent from) and `SMTP_RECIPIENTS` (who it goes to, comma-separated). Any relay works -- Microsoft 365, Google Workspace, your host's mail server or an internal relay. The `smtp_*` and `report_recipients` keys in config are fallbacks only; whatever is set in `.env` wins.
+3. **SMTP** -- mail server details go in `.env`: `SMTP_HOST`, `SMTP_PORT`, `SMTP_SECURITY`, `SMTP_USERNAME`, `SMTP_PASSWORD` and `SMTP_FROM` (the address mail is sent from). Any relay works -- Microsoft 365, Google Workspace, your host's mail server or an internal relay. The `smtp_*` keys in config are fallbacks only; whatever is set in `.env` wins.
+
+   **Recipients are per mailing, not global.** All four live in one `email:` block at the top of `config.yaml`, so "who gets what" is answerable without reading the code:
+
+   ```yaml
+   email:
+     recipients:
+       weekly_report:  [manager@example.com]     # the weekly chat analysis
+       daily_leads:    [sales@example.com]       # the morning call list
+       lead_alerts:    [sales@example.com]       # one per lead, if alert_on_leads
+       job_failures:   [ops@example.com]         # a scheduled job failed
+   ```
+
+   | Mailing | Goes out | .env override |
+   |---|---|---|
+   | `weekly_report` | Weekly, after the chat analysis | `REPORT_RECIPIENTS` |
+   | `daily_leads` | Every morning, the previous day's leads | `LEADS_RECIPIENTS` |
+   | `lead_alerts` | One per lead, the moment it is found | `LEAD_ALERT_RECIPIENTS` |
+   | `job_failures` | When a scheduled job fails | `JOB_FAILURE_RECIPIENTS` |
+
+   Lead alerts and job failures used to share one list, which meant sales could not be told about leads without also being told the nightly job crashed. They are separate lists now.
+
+   Mail **server** settings (host, port, credentials, TLS) are a separate concern and stay in `.env` as `SMTP_*`.
+
+   **An empty list means that mailing is not sent** -- it is how you switch one off, and it is reported as `skipped` rather than as a failure, so a job does not exit non-zero every morning for being configured that way.
+
+   `SMTP_RECIPIENTS` is **no longer read**. It used to override everything, which meant every mailing went to the same people and pointing one somewhere else was not possible without moving the others too. The older flat keys (`report_recipients`, `leads_recipients`, `alert_recipients` under `chat_insights`) are still read as a fallback, so an existing config.yaml keeps working.
+
+   To see what is actually configured:
+
+   ```bash
+   python -m chat_insights.weekly_run --dry-run
+   ```
 
 Design notes worth knowing:
 
+- **Popular keywords are computed in code, not by the model.** Customer messages only -- counting the bot's replies would measure the script rather than the demand. Terms are counted per *conversation*, so one customer repeating themselves five times counts once; plurals are folded together, greetings and filler are dropped, and a phrase beats its own words ("blue metal" wins, bare "metal" goes). Each term carries how many of its conversations the bot failed on, which is the number worth acting on: a term that comes up often **and** that the bot keeps failing on is a content gap with demand already attached. Text is redacted before it is tokenised, so no fragment of a phone number can surface as a keyword.
+- **Week-on-week deltas.** Each headline figure shows movement against the previous completed week, matched on week start rather than run order, and skipping runs that failed. There is nothing to compare on the first ever run, so the deltas simply do not render -- no invented baseline.
+- **Built to survive real mail clients.** Every style is inline, the layout is tables, and bars are nested table cells with a `bgcolor` rather than styled divs -- Outlook renders through Word, which ignores `border-radius` and mishandles a div given a percentage width. Stat tiles use the fluid-hybrid pattern (inline-blocks with a max width, plus an MSO conditional table for Outlook) so they sit four across on a desktop and reflow to two on a phone **without** a media query, since several clients strip `<style>` blocks. There is hidden preheader text so the inbox list shows the week's numbers before the mail is opened, and the subject line carries the direction of travel.
+- **A real plain-text part.** The alternative part is the actual report, not a "your client cannot display this" stub. That is what mail search indexes, and what gets quoted when somebody forwards the report with a question on top.
 - **Deterministic first.** Volume, per-day counts, negative feedback and bot-failure detection are computed in code; the model is only asked for topic, category, sentiment, lead detection and a one-line summary per conversation. On a CPU-only host every avoided generation is real time saved.
 - **This uses Chatbase's v1 API, not v2.** v2 (`/api/v2/agents/{id}/conversations`) returns an empty list for these agents; v1 (`/api/v1/get-conversations`) has the actual conversations *and* supports server-side `startDate`/`endDate`. The exact `[start, end)` boundary is still enforced on timestamps locally, because v1's date filter is whole-day and its inclusivity is undocumented.
 - **A wrong agent id fails silently.** Chatbase answers an unknown agent with `200` and an empty list rather than a 404, so a misconfiguration looks exactly like "no chats this week". Use `--list-agents` to confirm, and check the conversation count on the first run.
@@ -271,8 +423,8 @@ Design notes worth knowing:
 ## Scheduled jobs
 
 `scripts/register_scheduled_tasks.ps1`, run once from an **elevated** PowerShell,
-registers four Windows tasks: the daily content job, the weekly chat job, and
-at-boot services for the dashboard and Ollama. The services are not optional
+registers five Windows tasks: the daily content job, the weekly chat job, the
+daily image cleanup, and at-boot services for the dashboard and Ollama. The services are not optional
 extras -- Ollama ships as a per-user Startup shortcut that only runs while
 someone is logged in, so without one the scheduled jobs wake to no local model.
 
@@ -300,6 +452,521 @@ logon was refused: re-register with `-LogonType Password`.
 Once tasks do run, their output is in `logs/` and readable in the dashboard at
 **Settings -> Job logs** (admin only), so checking on a job does not need an RDP
 session.
+
+### "The job did not run"
+
+Check in this order -- the first two answer it most of the time:
+
+```powershell
+.\scripts\job_status.ps1 -History
+```
+
+- **`NextRun` is a day you did not expect.** The job did not fail; it is
+  scheduled for a different day. This is the common one. `Result 0` with a
+  sensible `LastRun` means the last run *worked*.
+- **`How` says "on demand"** for the run you thought was automatic. `LastRunTime`
+  is updated identically by a scheduled fire and by someone pressing Run, so it
+  cannot tell the two apart -- only the event log can, which is what `-History`
+  reads.
+- **`Result 267011`, no log file.** The task never started: a Task Scheduler
+  problem, not an application one. See the `Get-WinEvent` query above.
+- **Nothing in the dashboard, but the task succeeded.** Read the job's own log
+  under Settings -> Job logs.
+
+A note on those log files: the scheduled task appends through `cmd`, which
+writes plain bytes, but running the same job by hand from PowerShell with `>>`
+writes UTF-16 and leaves the file mixed. The dashboard decodes either (and both
+in one file), but `Get-Content` on a mixed file shows the plain-text half as
+mojibake. Use the dashboard, or `python -c "from dashboard import job_logs;
+print(job_logs.tail('weekly_chat')['text'])"`. The files are owned by SYSTEM, so
+rewriting one needs an elevated shell.
+
+## Leads
+
+Chat Insights records every buying signal it finds as a **lead**, visible at
+**Chat Insights -> Leads**, and emails you the moment one is detected.
+
+This exists because the normal path is not reliable: a lead reaches the CRM via
+a Chatbase action that calls Zapier, and when that action does not fire, Zapier
+never runs -- so there is nothing on the Zapier side to reconcile against and
+the lead simply disappears. This is a second, independent path built from the
+conversation data stored locally. A dead action now costs a duplicate, not a
+customer.
+
+**A lead needs contact details.** Buying intent with no phone number and no
+email is not something anyone can follow up, so it is not recorded here at all
+-- it stays counted in the weekly report's stats and readable in the
+transcripts. Conversely, contact details are *enough*: someone who types their
+phone number into a building supplier's chat is a lead, and it does not need a
+model to agree. The analysis still supplies the category and what they want; it
+no longer decides whether the lead exists.
+
+### Did the hand-off actually happen?
+
+This is the part that matters most, and it is not something Zapier can tell you.
+
+There is no contact form on this deployment -- across every conversation stored,
+`form_submission` is null on all of them. Customers type their details into the
+chat, often spread over several messages. The bot is supposed to fire an action
+that sends them onward, and **sometimes it does not, while still telling the
+customer that it has**:
+
+> **Perfect! I have all your details now:** Name: M Sharma &middot; Phone:
+> 0452127283 &middot; Postcode: 2560
+> Thank you. **I have forwarded your details and request to our sales team for a
+> callback.**
+
+Nothing was forwarded. There is no record on the Zapier side either, because the
+action never started -- so reconciling against Zapier's history finds nothing to
+reconcile. The failure is visible in exactly one place: the message stream.
+
+When an action really runs, Chatbase records it as three consecutive messages:
+
+```
+assistant   ""                  <- empty; carries the tool call
+tool        ""                  <- the action result
+assistant   "Great, I've ..."   <- the only part the customer sees
+```
+
+Only the third is visible in the chat. So a hand-off claim with those two
+messages immediately in front of it is real, and a claim without them is the bot
+narrating something that never ran. `chat_insights/handoff.py` does exactly that
+check. Every lead carries the verdict:
+
+| State | Meaning |
+|---|---|
+| `claimed_not_fired` | **The customer was told their details were forwarded. They were not.** Somebody is waiting on a call nobody knows to make. |
+| `no_claim` | Contact details shared, no hand-off claimed. Nobody was promised anything, but there is someone contactable. |
+| `fired` | The action ran. Listed so it can be reconciled against the CRM -- if one of these is missing there, the problem is downstream. |
+
+Adjacency is the whole test, and it has to be: a conversation can contain an
+earlier action for something else (the delivery calculator uses the same
+mechanism), so "contains a tool call somewhere" proves nothing. What counts is
+whether one sits immediately before the sentence claiming it.
+
+No model is involved -- this is a structural property of the message list. That
+keeps the daily job fast and means it still works on a day Ollama is down.
+
+### The daily lead email
+
+Separate from the weekly report on purpose: a customer promised a callback
+cannot wait until Thursday. `BCSands-Leads-Daily` runs every morning (07:30 by
+default) and emails the sales team **the previous day's leads** -- the ones the
+chatbot failed to forward and the ones it forwarded, in one list.
+
+It reports a whole day, local midnight to midnight, not the last 24 hours. Run
+at 07:30 on Tuesday it covers all of Monday: a period somebody can name, and one
+that does not split Monday evening's enquiries across two emails. It fetches a
+day wider than it reports, so a chat that started before midnight and ran past
+it still lands in the right day.
+
+**The email carries no technical detail.** It goes to people holding a phone, so
+each lead is four fields and a link:
+
+```
+Name    : Luke Clark
+Phone   : 0423100442            <- tel: link
+Email   : --
+Inquiry : 3/4 of a 1 tonne bulk bag of Fine Cypress mulch
+          [ Read the full conversation -> ]
+```
+
+A lead needs **at least one of phone or email** to be listed at all -- a name on
+its own is not something anyone can act on. The transcript link is the card's
+escape hatch: company name, delivery suburb, quantities and what the bot actually
+said are all one click away. The weekly report links each lead, unanswered
+question and unhappy customer the same way.
+
+### Knowing the email went
+
+Every run of the morning job writes a row: the day it covered, how many leads
+were in it, what happened to the email, who it went to, and whether Task
+Scheduler or a person started it. **Chat Insights -> Leads -> Morning lead
+emails** lays the last fortnight out one day per row.
+
+The reason is a failure mode the inbox cannot show you. A morning where the job
+did not fire looks exactly like a morning with no leads -- in both cases nothing
+arrives. The difference matters: one means nobody needs calling, the other means
+somebody does and nobody knows. Laying the days out makes the gap visible, and
+the page names the dates rather than counting them, because a date is something
+you can go and cover.
+
+The outcome is recorded as one of five, not as success or failure:
+
+| Recorded | What it means |
+|---|---|
+| `sent` | It went, and to whom |
+| `failed` | The relay refused it. This is the only bad one |
+| `no_leads` | A quiet day, and `leads_email_when_empty` is false |
+| `no_recipients` | Nobody is configured for `daily_leads` |
+| `not_requested` | Run with `--no-email` |
+
+Three of those are the mailing working exactly as configured. Collapsing them
+into "failed" would have Task Scheduler report a broken job most mornings, and
+paint the page red on a quiet Sunday -- which is how a warning gets ignored.
+
+Days before the first recorded run show as **Not tracked** rather than missed.
+Nothing failed then; this simply was not recording yet. Without that distinction
+the feature would announce a fortnight of failures the morning it shipped.
+
+### Running it by hand
+
+**Send the morning email**, on the same page, runs the whole job now: fetch,
+detect, email. It does exactly what the scheduled task does and is recorded the
+same way, marked as a manual run against whoever pressed it.
+
+It exists because of who is affected when the scheduled task does not fire. The
+people waiting on those leads are the sales team, and before this they had to
+find somebody with a server login to get their morning list. Now they can cover
+the day themselves.
+
+Safe to press twice -- the same leads simply go out again. It runs in the
+background and takes a few seconds to a minute depending on how much Chatbase
+has to hand back, so the page says to refresh rather than appearing to hang.
+
+From a terminal, the same thing:
+
+```bash
+python -m chat_insights.daily_leads
+```
+
+### Getting the details right
+
+Two passes, and the order matters.
+
+**Rules first.** Phone numbers and email addresses have a shape, so they are
+found deterministically -- fast, free, and not dependent on anything being up.
+
+**Then a model, over leads only.** Names and the enquiry have no shape. These
+three fragments are identical as far as a rule is concerned:
+
+```
+paul strachan     a name
+but prefer        the remains of a sentence with the number cut out
+garden stakes     a product
+```
+
+Telling them apart needs to know what the words mean. So a model gets a second
+pass, but only over conversations already identified as leads -- a handful a
+day, not all 45 conversations.
+
+**It cannot invent a contact.** A model asked for a phone number will produce
+one whether or not there was one, so every value it returns is checked back
+against the customer's own words: a phone or email has to be there digit for
+digit, a name has to be there as text. Anything that fails is dropped and the
+rule-based value stands. The model's job is to *point at* the right span, not to
+author it. Tested against a model that invents numbers, invents names, returns
+the branch's own contact details, returns junk, and throws -- in every case the
+lead comes out as the rules found it.
+
+**It cannot be a dependency.** The rule-based result goes in and comes back out
+unchanged if the model is off, down, slow or wrong. The daily job still works
+with Ollama stopped.
+
+**It is paid for once.** A conversation's transcript never changes once it has
+ended, so the extraction is cached on the lead (`extracted_at`) and later syncs
+skip it. Without that, every sync -- the daily job *and* the dashboard's Sync
+button -- re-ran the model over the whole back catalogue.
+
+```yaml
+chat_insights:
+  lead_extraction:
+    enabled: true
+    model: local            # local | claude
+    local_model: llama3.2:3b
+```
+
+`local` costs nothing and takes ~10s per new lead on this CPU-only host.
+`claude` is faster and more accurate, and needs a working `ANTHROPIC_API_KEY`.
+Either way it runs on new leads only.
+
+Names are read from the customer's own wording -- `Luke Clark, 0423100442`,
+`Belinda mob:- 0430619277`, `my name is Priya Nair` -- and are **anchored on a
+phone number or email already found**, because a name cannot be recognised on
+its own: `Marrickville`, `Personal` and `Riviera Projects` all look exactly like
+one. Reading the name only out of the bot's structured read-back found 2 of 11;
+anchoring finds all 11.
+
+Three groups:
+
+| Heading | Means |
+|---|---|
+| **Expecting your call** | The chatbot told them someone would ring back. Nothing was sent, so this call is only going to happen if somebody makes it. |
+| **New enquiries** | They left details; no callback was promised. |
+| **Already sent through** | Also came through the usual way, so they may already be in the list. |
+
+Nothing in it mentions actions, tool calls, Zapier or hand-off states. Whether
+the forwarding step fired is our problem to fix, not something a salesperson can
+act on -- that detail stays on the lead record and is shown in the dashboard,
+where someone debugging the chatbot will look for it.
+
+Each email is that day's leads; it does not carry unactioned ones forward. The
+running list of everything still open is in the dashboard under **Chat Insights
+-> Leads**. If you would rather the email repeated the last few days each
+morning, raise `leads_lookback_days`.
+
+```bash
+python -m chat_insights.daily_leads --dry-run     # see the digest without sending
+python -m chat_insights.daily_leads --no-fetch    # re-detect over stored conversations
+python -m chat_insights.daily_leads               # the real job
+```
+
+Phone numbers are `tel:` links and emails are `mailto:` links, because this is
+read on a phone by someone about to make the call.
+
+`alert_on_leads` is **off**: the morning digest is the one lead mailing. Turning
+it back on adds a second email per lead, sent the moment it is detected.
+
+With `leads_email_when_empty: false` a day with no leads sends **no email at
+all**. Set it to `true` if you would rather have the daily confirmation, which
+also makes a missing email mean "the job did not run" rather than "no leads".
+
+Two types remain, and they fail differently:
+
+| Type | What happened | Does a CRM hand-off exist? |
+|---|---|---|
+| `form_submission` | Customer filled the contact form | Yes -- so one of these missing from the CRM means the action did not fire. Never seen on this deployment |
+| `contact_shared` | Customer typed a phone or email into the chat | **No** -- Chatbase has nothing to send, so these were previously invisible |
+
+Leads are also filtered by the analysis category (`product_enquiry`,
+`stock_availability`, `delivery`, ...) and carry a status you set as you work
+them (`new` -> `contacted` -> `won`/`lost`/`ignored`). A re-sync refreshes
+detection but never overwrites a status, owner or note a human set.
+
+Configure in `config.yaml` under `chat_insights`:
+
+```yaml
+alert_on_leads: false         # the daily digest is the lead mailing now
+alert_lead_types: ["form_submission", "contact_shared"]
+alert_on_job_failure: true
+
+leads_lookback_days: 1        # 1 = yesterday. Raise it to repeat recent days
+leads_email_when_empty: true  # a quiet day is still worth confirming
+leads_recipients: []          # blank = same recipients as the weekly report
+own_contacts:                 # OUR numbers, so they are never read as a customer's
+  - "(02) 8543 3401"
+  - "sales@bcsands.com.au"
+```
+
+**`own_contacts` matters more than it looks.** The bot quotes the branch numbers
+constantly -- one appears 60 times across the stored conversations and another
+50, while a real customer's number appears once or twice. Anything not listed
+here can be harvested as if a customer had given it. `phone_display` and
+`phone_tel` are covered automatically; add any other number the bot quotes.
+
+Set `DASHBOARD_BASE_URL` in `.env` (e.g. `http://BCSANDSAS08:8420`) so alert
+emails carry working links back to the transcript. Without it the alerts still
+send, just without links.
+
+> **A note on the data.** `form_submission` -- the name, email and phone the
+> customer typed into the contact form -- was fetched from Chatbase and then
+> discarded when conversations were saved. It is now stored. Conversations
+> fetched before that change have no form details on record; re-running a past
+> week backfills them from the API.
+
+## Confirming an action
+
+Every action on the dashboard asks before it runs -- approving, rejecting,
+publishing, regenerating, syncing leads, emailing a report, deleting staged
+images, creating and disabling logins.
+
+The reason is not caution for its own sake. Most of these cannot be undone from
+this side: a description written to Odoo has to be put back in Odoo, an email
+that has gone has gone, a deleted staged file was the only copy. And the buttons
+sit close together by design -- Approve is one button along from Reject on every
+card in the review queue.
+
+The dialog says what will happen rather than asking whether you are sure, and it
+quotes the subject back, because six cards are usually open at once and "this
+description" is only half an answer. Cancel takes the keyboard focus, not the
+go-ahead: a stray Enter landing on a dialog nobody has read should not be what
+publishes to Odoo. Escape cancels.
+
+Two things deliberately do **not** ask. Opening the editor and closing it again
+without typing anything, and removing an extra section that is still empty --
+there is nothing to lose in either, and a dialog with no stakes is what teaches
+people to click through the ones that have some.
+
+Adding an action to the dashboard is one call to `_confirm()` in
+`dashboard/app.py`, which builds the `data-confirm` attributes that
+`dashboard/ui.py` picks up. Nothing else needs wiring, and the interception
+happens on the button rather than the form submit -- several of these forms
+carry two buttons with different `formaction`s, and guessing wrong there would
+approve something a reviewer meant to reject.
+
+## Editing a draft
+
+A reviewer can rewrite any of the model's copy before approving it. Overview,
+Features and Applications are always there; **Extra sections** covers everything
+those three do not.
+
+Some products need a heading the standard two cannot express -- Technical
+Details, Coverage, Care Instructions -- so the heading itself is editable rather
+than fixed in code. Adding a fourth hard-coded field would only move the
+problem, because the next product needs a fifth. Give the section a heading and
+one point per line; it publishes in exactly the same style as Features and
+Applications, after them and before the delivery/disclaimer tail.
+
+Up to six extra sections per product. A section with a heading but no points
+(or points but no heading) is dropped rather than published empty -- which is
+also how you delete one: clear either half.
+
+Stored on the draft as `sections: [{"heading": ..., "items": [...]}]`, and
+normalised on the way in and on the way out, so a draft written before this
+existed, or one whose raw JSON was hand-edited, cannot break the assembler.
+
+## Regenerating a rejected draft
+
+Rejected drafts sit under **Content Agent -> Rejected** until they are
+regenerated or re-opened. By default a retry walks the normal escalation chain
+at a higher temperature, with the rejection reason passed along as context.
+
+The dropdown next to **Regenerate** pins the retry to one model instead:
+
+| Choice | What runs |
+|---|---|
+| Escalation chain (default) | Fine-tuned model, escalating as usual |
+| Fine-tuned model | Only that |
+| Fallback model | Only that |
+| Claude | Only that |
+
+A reviewer looking at a rejected draft has just read what the last model
+produced, so they usually know which rung to reach for -- and each guess costs a
+full generation round-trip per product.
+
+**Pinned means pinned:** the run does not escalate past the chosen model. "Use
+Claude" that quietly falls back to the model whose output was already rejected
+is not what was asked for, and the reviewer would have no way to tell which one
+they were reading.
+
+A model that cannot run right now is shown disabled **with the reason**
+(`Fallback model -- llama3.2:3b is not pulled`) rather than hidden, and the
+choice is re-checked server-side: an unavailable rung is refused before any
+background job starts, so nobody waits on a generation that was never going to
+happen. The same picker sits on the bulk bar and on "Regenerate all rejected".
+
+## Product images
+
+A reviewer attaches the product's photos to the draft they are already looking
+at, and **the images go to Odoo in the same action as the description**.
+
+This closes a gap that used to be filled by hand. The agent wrote the copy on
+approval; somebody opened Odoo later and added the pictures. Between those two
+moments the product was live with text and no photos, and "later" was whenever
+anyone remembered.
+
+On each pending draft there is a **Product images** strip below the copy and
+above the approve buttons -- the order a reviewer actually works in. Drop files
+on it or click to browse. The first image is the product's main photo; **Set
+main** promotes any other one. Nothing is sent anywhere until you approve.
+
+### What is checked at upload
+
+Format is decided by reading the file's leading bytes, not its name or the
+content type the browser claims -- both of those come from the client. A `.jpg`
+that is actually HTML, or an SVG renamed to `.png`, is refused. JPEG, PNG, GIF
+and WebP are accepted; there is no resizing step because Odoo's image fields
+downscale on write and generate their own thumbnails.
+
+Limits are in `config.yaml`:
+
+```yaml
+product_images:
+  enabled: true
+  max_files_per_product: 8
+  max_file_mb: 8
+  retain_days_after_verify: 7
+```
+
+### Staging, and why files are not deleted on publish
+
+An uploaded image lives in `logs/product_images/<queue row>/` until it has been
+**confirmed present on the product**, which is a different claim from "the
+upload succeeded". Four states, tracked per image:
+
+| State | Meaning |
+|---|---|
+| Awaiting review | staged here, not sent anywhere |
+| Sent, not verified | Odoo accepted the write |
+| Verified on Odoo | the product was read back and the image was there |
+| Reclaimed | the staged copy has been deleted |
+
+Only **verified** images are ever eligible for deletion, and only after
+`retain_days_after_verify`. While a file is staged, this server holds the only
+copy of it, so an XML-RPC call that returned without raising is not treated as
+sufficient reason to delete one. If Odoo is unreachable when verification runs,
+nothing is deleted -- a failed read-back says nothing about the image.
+
+The database row outlives the file: what was sent, by whom, and when stays in
+the trail after the bytes are reclaimed.
+
+### Cleanup
+
+`BCSands-ReclaimImages` runs daily (23:00 by default) and does two things in
+order: verify published images against Odoo, then delete the staged copies of
+whatever passed. Run it by hand with:
+
+```bash
+python -m scripts.reclaim_images
+```
+
+**Settings -> Images** (admin only) shows the four counts, disk usage, and both
+actions as buttons. It also lists the one state worth chasing: images Odoo
+accepted that were **not** on the product when read back -- where a reviewer
+believes the job is done and it is not. Those keep their local copies; re-publish
+the queue row, or check the product in Odoo.
+
+## Site health
+
+The dashboard watches the online shop and emails when a page goes down, slows down or shows a problem. **Site health** in the sidebar shows each page's status, a 24-hour load-time chart, uptime and recent problems. Admins and reviewers can both see it; only admins can change the settings, run a check or send a test email.
+
+**What it checks, and why that way.** Zen Cart is only reachable with a shop session, and Cloudflare shows its bot check ("Just a moment") to automated requests on every Zen Cart address. So the shop is checked two ways. **Direct** goes straight to the shop server on the office network, where there is no challenge, and tells you the shop server itself works. **Through Cloudflare** reaches the shop the way customers do, and tells you they can get to it. That second check relies on a Cloudflare rule letting the office's internet address through -- 220.233.203.122, set as the office address on the Site health page. The monitor never tries to get past the bot check any other way. Until the rule exists, or if the office address ever changes, that page shows "Blocked by Cloudflare", and the alert names the address Cloudflare saw next to the one the rule allows. By default the monitor checks the shop home page both ways, a category page and the landing page.
+
+Each check confirms the page answers, lands where it should, contains what it must (the shop's title, say), loads in reasonable time and has a valid certificate. A page that answers "success" but shows an error or the wrong page still counts as a problem.
+
+**Keeping load off the shop.** Opening a new Zen Cart session costs the shop server about five seconds of work; loading a page in an existing session costs well under one. So the monitor keeps one session of its own and reuses it on every check. Beyond that: one GET per page, HTML only -- no images, stylesheets or scripts -- pages one at a time with a pause between, a timeout on every request, a lock so two runs never overlap, and no immediate retry when a page fails. The one exception is a single re-check when a page is slow, so a cold cache or a renewed session is not reported as a slow site. It identifies itself as `BCSands-SiteMonitor`, so it can be filtered out of analytics.
+
+**When it emails.** A problem has to repeat before anyone is told, and each problem is one email when it starts and one when it ends:
+
+| Situation | Email when | Then |
+|---|---|---|
+| Down | 2 failed checks in a row | a reminder every hour while down, and a recovery email |
+| Slow | 3 checks in a row over 3 seconds | a recovery email |
+| Wrong page, server error, bad certificate | 2 checks in a row | a recovery email |
+| Blocked by Cloudflare | 3 checks in a row | a recovery email |
+| Certificate expiring | 21 and 7 days before | once each |
+
+From 21:00 to 06:00 alerts are held, not sent. Pages are still checked and recorded, and one summary goes out at 06:30 with everything that happened overnight and anything still wrong. Reminders wait for that summary rather than arriving just before it.
+
+Before calling an outside page down, the monitor checks that this server can reach the internet at all. If it cannot, the check is recorded as "could not check" and never counts toward an alert, so a broken office connection is not reported as the site going down. That is also its limit: a monitor inside the office cannot warn you when the office internet or mail server is down.
+
+Everything above -- who gets alerts, quiet hours, thresholds, which pages -- is changed on the Site health page; `config.yaml` only holds the starting values. The checks run from the scheduled task `BCSands-SiteMonitor` every five minutes, and its log is under Job history.
+
+## Audit trail
+
+Content approved in the dashboard goes out to a live public site, so every
+decision records **who made it**. Rows carry `reviewed_by`, shown on the History
+and Rejected lists, and an append-only `audit_log` records approvals,
+rejections, edits, publishes (including failed ones), re-opens, and user
+administration -- creating an account, resetting a password, disabling a user.
+
+Admins read it at **Settings -> Audit**, filtered by person or action. Bulk
+actions write one entry per row rather than a single summary line, so tracing
+one product's history actually works.
+
+Two limits worth knowing: decisions made before the trail existed are not
+backfilled, and an audit write that fails is logged but never blocks the action
+it was recording -- bookkeeping should not stop work.
+
+## Job failure alerts
+
+Both scheduled jobs email on failure, through the same mail server as the
+reports. The weekly job alerts if the run raises; the daily job alerts if it
+cannot source products, if the batch dies, **and if every product in a run
+failed** -- that last case otherwise looks exactly like a normal quiet run.
+
+Alerting never fails a job: an alert that cannot be sent is logged and the run
+continues.
 
 ## Escalation chain
 
@@ -340,6 +1007,8 @@ usually the faster route to something publishable.
 ## Connecting to your platform
 
 `connectors/odoo_connector.py` ships as a working example against Odoo's XML-RPC API. If you're on a different platform, implement `BaseConnector`'s three methods (`is_configured`, `write_product_description`, `get_product`, plus `list_products` for live pulls) against your platform's API -- the rest of the pipeline doesn't care which platform it's talking to.
+
+Image upload is an optional capability rather than part of that contract, so a connector written before it existed keeps working. To support it, override `supports_images` (return `True`), `write_product_images`, and `get_product_image_state`. Leave them alone and the dashboard reports honestly that your platform cannot take images, instead of failing at publish time.
 
 One Odoo-specific note: external API (XML-RPC/JSON-RPC) access on Odoo Online is only available on Custom pricing plans, not the Free or Standard tiers. Self-hosted and Odoo.sh instances aren't affected by this. Run `tests/test_odoo_connection.py` to check whether your instance supports it before relying on live pulls.
 

@@ -36,6 +36,7 @@ import pandas as pd
 
 from content_seo_agent import content_status as cs
 from content_seo_agent.batch_runner import process_dataframe, load_products, SUMMARY_LOG_PATH
+from content_seo_agent.demand_link import demand_terms
 from connectors.odoo_connector import odoo_connector
 from config import settings
 from datetime import datetime, timezone
@@ -81,6 +82,25 @@ def get_current_products() -> tuple[pd.DataFrame, str]:
     return df, "static_file_fallback"
 
 
+def _alert_failure(detail: str) -> None:
+    """Emails someone that the daily job broke.
+
+    The jobs run unattended under Task Scheduler, so without this a failure is
+    only visible to whoever thinks to open the log. Imported lazily and wrapped:
+    the alerting path lives in chat_insights, and the content job must not die
+    because the mail relay is down.
+    """
+    try:
+        from config import settings
+        if not settings.CHAT_ALERT_JOB_FAILURES:
+            return
+        from chat_insights import alerts
+        alerts.send_job_failure_alert("Content Agent (daily)", detail,
+                                       log_file="logs/scheduled_daily_run.log")
+    except Exception as e:      # noqa: BLE001 -- an alert must never fail the job
+        print(f"(could not send the failure alert: {e})")
+
+
 if __name__ == "__main__":
     run_started = datetime.now(timezone.utc).isoformat()
     print(f"=== Daily run started: {run_started} ===")
@@ -90,15 +110,33 @@ if __name__ == "__main__":
         df, source = get_current_products()
     except Exception as e:
         print(f"FATAL: could not source a product list: {e}")
+        _alert_failure(f"Could not source a product list.\n\n{type(e).__name__}: {e}")
         sys.exit(1)
 
-    results = process_dataframe(
-        df,
-        limit=DAILY_BATCH_SIZE,
-        target_statuses=cs.NEEDS_DRAFTING,
-        delay=DELAY_SECONDS,
-        force=False,
-    )
+    try:
+        results = process_dataframe(
+            df,
+            limit=DAILY_BATCH_SIZE,
+            target_statuses=cs.NEEDS_DRAFTING,
+            delay=DELAY_SECONDS,
+            force=False,
+            # Draft what customers are asking about first. Returns {} if Chat
+            # Insights cannot be read, and the order is then unchanged.
+            priority_terms=demand_terms(),
+        )
+    except Exception as e:
+        print(f"FATAL: the batch failed: {e}")
+        _alert_failure(f"The drafting batch stopped with an error.\n\n{type(e).__name__}: {e}")
+        sys.exit(1)
+
+    # A run that "succeeds" while failing every product is a failure worth
+    # hearing about -- it looks like a normal quiet run in the summary log.
+    if results["total"] and results["failed"] == results["total"]:
+        _alert_failure(
+            f"All {results['total']} products in this run failed to draft.\n\n"
+            f"Source: {source}\n"
+            f"This usually means Ollama is not reachable, or every escalation "
+            f"rung is unavailable. See logs/agent_runs.log.")
 
     summary = (
         f"\n{'='*60}\n"

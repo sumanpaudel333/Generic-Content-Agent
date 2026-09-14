@@ -114,6 +114,39 @@ REGENERATE_TEMPERATURE = float(_approval_cfg.get("regenerate_temperature", 0.8))
 REGENERATE_ESCALATE_FIRST = bool(_approval_cfg.get("regenerate_escalate_first", False))
 
 # ---------------------------------------------------------------------------
+# Reviewer-supplied product images
+#
+# Images are staged on this server between upload and publish, then written to
+# the platform in the same action as the description. retain_days_after_verify
+# is the only setting with teeth: it is how long a staged file is kept AFTER
+# the image has been confirmed present on the product. Set it to 0 to reclaim
+# as soon as verification passes; leave it a few days if you would rather have
+# the original to hand when someone asks why a photo looks wrong.
+# ---------------------------------------------------------------------------
+_images_cfg = _cfg.get("product_images", {}) or {}
+IMAGES_ENABLED = bool(_images_cfg.get("enabled", True))
+IMAGES_MAX_PER_PRODUCT = max(1, int(_images_cfg.get("max_files_per_product", 8)))
+IMAGES_MAX_FILE_MB = float(_images_cfg.get("max_file_mb", 8))
+IMAGES_MAX_FILE_BYTES = int(IMAGES_MAX_FILE_MB * 1024 * 1024)
+IMAGES_RETAIN_DAYS = max(0, int(_images_cfg.get("retain_days_after_verify", 7)))
+
+# ---------------------------------------------------------------------------
+# Dashboard
+#
+# Where this dashboard can be reached, used to put working links into alert
+# emails. Overridden by DASHBOARD_BASE_URL in .env. Left blank, alerts still
+# send -- they just carry no links.
+# ---------------------------------------------------------------------------
+_dashboard_cfg = _cfg.get("dashboard", {}) or {}
+DASHBOARD_BASE_URL = str(_dashboard_cfg.get("base_url", "") or "")
+
+# ---------------------------------------------------------------------------
+# Site monitor -- starting values for site_monitor/store.py. Settings saved on
+# the Site health page take over from these, one setting at a time.
+# ---------------------------------------------------------------------------
+SITE_MONITOR_CONFIG = dict(_cfg.get("site_monitor", {}) or {})
+
+# ---------------------------------------------------------------------------
 # Chat Insights (weekly Chatbase analysis)
 # ---------------------------------------------------------------------------
 _chat_cfg = _cfg.get("chat_insights", {}) or {}
@@ -129,7 +162,45 @@ CHAT_TEMPERATURE = float(_chat_cfg.get("temperature", 0.2))
 CHAT_MAX_ANALYSIS_TOKENS = int(_chat_cfg.get("max_analysis_tokens", 400))
 CHAT_MIN_USER_MESSAGES = int(_chat_cfg.get("min_user_messages_for_analysis", 1))
 CHAT_REDACT_EMAIL = bool(_chat_cfg.get("redact_email", True))
-CHAT_REPORT_RECIPIENTS = list(_chat_cfg.get("report_recipients", []) or [])
+# ---------------------------------------------------------------------------
+# Who receives which email
+#
+# One list per mailing, gathered here rather than scattered through the module
+# that happens to send it -- "who gets what" is a question people ask about the
+# system as a whole, and it should be answerable from one block of config.
+#
+# There is no shared default. An empty list means that mailing is not sent,
+# which is how one gets switched off. .env overrides are resolved at send time
+# in chat_insights/mailer.py, not here.
+#
+# The legacy flat keys (report_recipients / leads_recipients / alert_recipients
+# under chat_insights) are still read, so an older config.yaml keeps working.
+# ---------------------------------------------------------------------------
+_email_cfg = _cfg.get("email", {}) or {}
+_recipients_cfg = _email_cfg.get("recipients", {}) or {}
+
+
+def _recipients_for(key: str, *legacy_keys: str) -> list:
+    configured = _recipients_cfg.get(key)
+    if configured:
+        return list(configured)
+    for legacy in legacy_keys:
+        old = _chat_cfg.get(legacy)
+        if old:
+            return list(old)
+    return []
+
+
+MAIL_RECIPIENTS = {
+    # key                what it is                                   legacy key
+    "weekly_report": _recipients_for("weekly_report", "report_recipients"),
+    "daily_leads": _recipients_for("daily_leads", "leads_recipients"),
+    "lead_alerts": _recipients_for("lead_alerts", "alert_recipients"),
+    "job_failures": _recipients_for("job_failures", "alert_recipients"),
+}
+
+# Kept as names for the two the rest of the code already referred to.
+CHAT_REPORT_RECIPIENTS = MAIL_RECIPIENTS["weekly_report"]
 # SMTP defaults. Every one of these is overridden by the matching .env key
 # (SMTP_HOST / SMTP_PORT / SMTP_SECURITY / SMTP_FROM) -- see chat_insights.mailer.
 CHAT_SMTP_HOST = str(_chat_cfg.get("smtp_host", "") or "")
@@ -137,8 +208,49 @@ CHAT_SMTP_PORT = int(_chat_cfg.get("smtp_port", 587))
 CHAT_SMTP_SECURITY = str(_chat_cfg.get("smtp_security", "") or "")
 CHAT_SMTP_FROM = str(_chat_cfg.get("smtp_from", "") or "")
 CHAT_SMTP_FROM_NAME = str(_chat_cfg.get("smtp_from_name", "") or "")
+
+# The display name on the emails about ACCOUNTS -- invitations and password
+# resets. Separate from the one above on purpose: a message asking somebody to
+# set a password must not arrive under the name of the weekly chat report,
+# which is both confusing and the exact shape of an email people are told to
+# distrust. Blank falls back to the dashboard's own name.
+ACCOUNT_EMAIL_FROM_NAME = str(_chat_cfg.get("account_email_from_name", "") or "")
 CHAT_SMTP_TLS_CA_FILE = str(_chat_cfg.get("smtp_tls_ca_file", "") or "")
 CHAT_SMTP_TLS_VERIFY = bool(_chat_cfg.get("smtp_tls_verify", True))
+
+# Lead alerts. Every detected lead is emailed as it is found, because the CRM
+# hand-off (a Chatbase action calling Zapier) sometimes does not fire and a
+# lead that only exists in a weekly report is a lead that waits days.
+CHAT_ALERT_LEADS = bool(_chat_cfg.get("alert_on_leads", True))
+# Phone numbers and email addresses that belong to US, not to a customer. The
+# bot quotes the branch numbers in nearly every conversation, so without this
+# list every chat looks like a lead offering us our own phone number back.
+# Branch numbers cannot be derived from anything else in config -- list them.
+CHAT_OWN_CONTACTS = list(_chat_cfg.get("own_contacts", []) or [])
+
+# Daily lead digest. Separate from the weekly report: a customer told their
+# details had been forwarded, when they were not, cannot wait for Thursday.
+# Recipients default to the weekly report's list when not set separately --
+# leads usually go to sales rather than to whoever reads the analysis.
+# Model-assisted lead extraction. The deterministic reader finds phone numbers
+# and emails reliably; names and the enquiry need to know what words mean
+# ("paul strachan" and "garden stakes" are the same shape). Runs over leads
+# only -- a handful a day -- and every value it returns is checked back against
+# the customer's own words before it is used, so it can add detail but cannot
+# invent a contact.
+_extract_cfg = _chat_cfg.get("lead_extraction", {}) or {}
+CHAT_LEAD_EXTRACT_ENABLED = bool(_extract_cfg.get("enabled", False))
+CHAT_LEAD_EXTRACT_MODEL = str(_extract_cfg.get("model", "claude") or "claude")
+CHAT_LEAD_EXTRACT_LOCAL_MODEL = str(_extract_cfg.get("local_model", "") or "")
+
+CHAT_LEADS_LOOKBACK_DAYS = max(1, int(_chat_cfg.get("leads_lookback_days", 3)))
+CHAT_LEADS_RECIPIENTS = MAIL_RECIPIENTS["daily_leads"]
+CHAT_LEADS_EMAIL_WHEN_EMPTY = bool(_chat_cfg.get("leads_email_when_empty", False))
+# Which lead types are worth an email. Both are, by default: every lead on the
+# list has contact details, or it would not be on the list.
+CHAT_ALERT_LEAD_TYPES = list(_chat_cfg.get(
+    "alert_lead_types", ["form_submission", "contact_shared"]) or [])
+CHAT_ALERT_JOB_FAILURES = bool(_chat_cfg.get("alert_on_job_failure", True))
 
 # ---------------------------------------------------------------------------
 # Derived: system prompts

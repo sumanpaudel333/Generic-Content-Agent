@@ -109,7 +109,44 @@ def get_already_processed_ids() -> set:
     return {str(r["product_id"]) for r in rows}
 
 
-def process_dataframe(df: pd.DataFrame, limit: int | None, target_statuses: set, delay: float, force: bool) -> dict:
+def _apply_demand_order(target_df: pd.DataFrame, priority_terms: dict | None):
+    """Puts the products customers are asking about at the front of the queue.
+
+    `priority_terms` is {term: weight}, produced by chat_insights.demand and
+    passed IN by the caller -- this module deliberately does not import the
+    chat side. That keeps drafting independent of whether Chat Insights is
+    configured, has ever run, or is working today.
+
+    Only ever reorders. Nothing is added or dropped, every product still gets
+    drafted, and the ones people are actually asking about get drafted first.
+    Ties keep the original order, so with no matching demand the queue is
+    exactly what it was.
+    """
+    if not priority_terms or target_df.empty:
+        return target_df, []
+
+    from chat_insights import demand  # local: only needed when terms were passed
+
+    scores = target_df["product_title"].astype(str).map(
+        lambda t: demand.score_title(t, priority_terms))
+    if not scores.any():
+        return target_df, []
+
+    target_df = target_df.assign(_demand=scores)
+    # mergesort is the stable one in pandas -- products with equal demand keep
+    # the order the source gave them.
+    target_df = target_df.sort_values("_demand", ascending=False, kind="mergesort")
+
+    promoted = [
+        (row["product_title"], int(row["_demand"]),
+         demand.explain(str(row["product_title"]), priority_terms)[:3])
+        for _, row in target_df[target_df["_demand"] > 0].head(10).iterrows()
+    ]
+    return target_df.drop(columns="_demand"), promoted
+
+
+def process_dataframe(df: pd.DataFrame, limit: int | None, target_statuses: set, delay: float,
+                       force: bool, priority_terms: dict | None = None) -> dict:
     """
     Core processing loop, shared by the manual CLI (run_batch) and the
     scheduled daily job (daily_run.py). Takes an already-loaded
@@ -144,6 +181,13 @@ def process_dataframe(df: pd.DataFrame, limit: int | None, target_statuses: set,
         if skipped:
             print(f"Skipping {skipped} products already in the review queue (resume behaviour). "
                   f"Use --force to reprocess them.")
+
+    target_df, promoted = _apply_demand_order(target_df, priority_terms)
+    if promoted:
+        print(f"Ordering by what customers asked about "
+              f"({len(priority_terms)} term(s) from Chat Insights):")
+        for title, score, terms in promoted:
+            print(f"  [{score:3}] {title[:64]}  <- {', '.join(terms)}")
 
     if limit is not None:
         target_df = target_df.head(limit)

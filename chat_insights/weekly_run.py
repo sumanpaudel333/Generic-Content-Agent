@@ -24,7 +24,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from dotenv import load_dotenv
 load_dotenv()
 
-from chat_insights import analyzer, chatbase_client, db, llm, mailer, redact, reporter
+from chat_insights import (alerts, analyzer, chatbase_client, db, lead_extract, leads, llm, mailer,
+                            redact, reporter)
 from config import settings
 
 logging.basicConfig(
@@ -101,20 +102,48 @@ def run_weekly(*, reference: datetime | None = None, send_email: bool = True,
         # --- aggregate + render ---
         stats = analyzer.aggregate(conversations, analyses)
         model_note = f"Analysis by {settings.CHAT_MODEL} running locally."
+        # Last week's numbers, so the report can show movement rather than a
+        # bare figure. None on the first ever run, and the deltas simply do not
+        # render -- no invented baseline.
+        previous_run = db.previous_complete_run(run_id)
+        previous = (previous_run or {}).get("stats") or None
+        report_url = alerts.dashboard_url(f"/chat-insights/run/{run_id}")
         full_html = reporter.render_report(stats, week_start, week_end,
-                                            truncated=truncated, model_note=model_note)
+                                            truncated=truncated, model_note=model_note,
+                                            previous=previous, dashboard_url=report_url)
+
+        # --- leads ---
+        # Before the report is emailed, and independent of it: a lead recorded
+        # here does not depend on Chatbase's Zapier action having fired, and the
+        # alert goes out now rather than waiting for someone to read the weekly
+        # report. Never allowed to fail the run -- the analysis is already
+        # stored, and a lead alert is not worth losing it over.
+        try:
+            lead_counts = leads.sync()
+            alert_result = alerts.send_lead_alerts()
+            logger.info("Leads: %s | alerts: %s", lead_counts, alert_result)
+        except Exception as e:
+            logger.exception("Lead sync/alerting failed (the run itself is fine): %s", e)
 
         # --- email ---
         email_status, email_detail = "skipped", "Email sending was not requested."
         if send_email:
             body = reporter.render_report(
                 stats, week_start, week_end, redacted=settings.CHAT_REDACT_EMAIL,
-                truncated=truncated, model_note=model_note)
-            outcome = mailer.send(reporter.render_subject(stats, week_start, week_end), body)
-            email_status = "sent" if outcome["success"] else "failed"
+                truncated=truncated, model_note=model_note,
+                previous=previous, dashboard_url=report_url)
+            text_body = reporter.render_text_report(
+                stats, week_start, week_end, redacted=settings.CHAT_REDACT_EMAIL,
+                dashboard_url=report_url)
+            outcome = mailer.send(
+                reporter.render_subject(stats, week_start, week_end, previous),
+                body, purpose="weekly_report", text_body=text_body)
+            email_status = ("sent" if outcome["success"]
+                             else "skipped" if outcome.get("skipped") else "failed")
             email_detail = outcome["detail"]
             logger.info("Email %s: %s", email_status, email_detail)
 
+        # pyrefly: ignore [bad-return]
         return db.finish_run(
             run_id, status=db.STATUS_COMPLETE, conversation_count=total,
             analysed_count=len(analyses), truncated=truncated, stats=stats,
@@ -122,6 +151,13 @@ def run_weekly(*, reference: datetime | None = None, send_email: bool = True,
 
     except Exception as e:
         logger.exception("Weekly run failed")
+        if settings.CHAT_ALERT_JOB_FAILURES:
+            try:
+                alerts.send_job_failure_alert(
+                    "Chat Insights (weekly)", f"{type(e).__name__}: {e}",
+                    log_file="logs/scheduled_weekly_chat.log")
+            except Exception:
+                logger.exception("Could not send the job failure alert")
         return db.finish_run(run_id, status=db.STATUS_FAILED, error=str(e))
 
 
@@ -142,12 +178,19 @@ def email_report(run_id: int) -> dict:
         return {"success": False,
                 "detail": "This run did not complete, so there is no report to send."}
 
+    previous = (db.previous_complete_run(run_id) or {}).get("stats") or None
+    report_url = alerts.dashboard_url(f"/chat-insights/run/{run_id}")
     body = reporter.render_report(
         stats, run["week_start"], run["week_end"], redacted=settings.CHAT_REDACT_EMAIL,
         truncated=bool(run.get("truncated")),
-        model_note=f"Analysis by {settings.CHAT_MODEL} running locally.")
+        model_note=f"Analysis by {settings.CHAT_MODEL} running locally.",
+        previous=previous, dashboard_url=report_url)
+    text_body = reporter.render_text_report(
+        stats, run["week_start"], run["week_end"],
+        redacted=settings.CHAT_REDACT_EMAIL, dashboard_url=report_url)
     outcome = mailer.send(
-        reporter.render_subject(stats, run["week_start"], run["week_end"]), body)
+        reporter.render_subject(stats, run["week_start"], run["week_end"], previous),
+        body, purpose="weekly_report", text_body=text_body)
     db.set_email_result(run_id, "sent" if outcome["success"] else "failed",
                         outcome["detail"])
     logger.info("Manual email for run %s: %s", run_id, outcome["detail"])
@@ -161,7 +204,13 @@ def status_lines() -> list[tuple[str, bool, str]]:
     return [
         ("Chatbase", chatbase_client.is_configured(), chatbase_client.config_status()),
         ("Analysis model", model_ok, model_detail),
-        ("Email", mailer.is_configured(), mailer.config_status()),
+        ("Email server", mailer.is_configured(), mailer.config_status()),
+        ("Lead extraction", *lead_extract.status()[::1]),
+        # One row per mailing, so "who gets what" is answerable from --dry-run
+        # without opening config.yaml.
+        *[(f"Recipients: {mailer.purpose_label(purpose)}",
+           bool(mailer.recipients_for(purpose)), mailer.config_status_for(purpose))
+          for purpose in mailer.MAIL_PURPOSES],
     ]
 
 

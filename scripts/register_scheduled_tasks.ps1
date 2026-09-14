@@ -9,6 +9,9 @@
     Scheduled jobs -- run, do their work, exit:
       * BCSands-ContentAgent-Daily  -- content_seo_agent/daily_run.py, once a day
       * BCSands-ChatInsights-Weekly -- chat_insights/weekly_run.py, once a week
+      * BCSands-Leads-Daily         -- chat_insights/daily_leads.py, every morning
+      * BCSands-ReclaimImages       -- scripts/reclaim_images.py, once a day
+      * BCSands-SiteMonitor         -- site_monitor/run.py, every few minutes
 
     Always-on services -- start at boot and stay up:
       * BCSands-Dashboard -- the review dashboard (uvicorn)
@@ -21,7 +24,7 @@
     low-confidence rows). The dashboard has the same problem -- started by hand
     in a console, it dies with the console.
 
-    All four run whether or not anyone is logged on. How they authenticate is
+    All six run whether or not anyone is logged on. How they authenticate is
     -LogonType:
 
       S4U       (default) service-for-user: no password stored anywhere. Needs
@@ -62,10 +65,22 @@
     jobs back into ones that never start, just because someone changed a time.
 
 .PARAMETER DailyAt
-    Time of day for the content job. Default 11:00.
+    Time of day for the content job. Default 1:00.
+
+.PARAMETER LeadsAt
+    Time of day for the daily lead digest. Default 07:30 -- before the sales
+    team starts, so the list is waiting rather than arriving mid-morning.
+
+.PARAMETER ReclaimImagesAt
+    Time of day for the image cleanup job. Default 23:00 -- after the day's
+    approvals, so the images it verifies are the ones just sent.
+
+.PARAMETER SiteMonitorEvery
+    Minutes between online shop checks. Default 5. Every check is one request
+    per monitored page, so going lower costs the shop more for little gain.
 
 .PARAMETER WeeklyAt
-    Time of day for the chat job. Default 11:00.
+    Time of day for the chat job. Default 2:00.
 
 .PARAMETER WeeklyOn
     Day of week for the chat job. Default Wednesday.
@@ -126,10 +141,14 @@
 #>
 [CmdletBinding()]
 param(
-    [string]$DailyAt = "11:00",
-    [string]$WeeklyAt = "11:00",
+    [string]$DailyAt = "1:11",
+    [string]$LeadsAt = "04:00",
+    [string]$ReclaimImagesAt = "00:10",
+    [ValidateRange(1, 60)]
+    [int]$SiteMonitorEvery = 5,
+    [string]$WeeklyAt = "2:00",
     [ValidateSet("Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday")]
-    [string]$WeeklyOn = "Wednesday",
+    [string]$WeeklyOn = "Monday",
     [int]$DashboardPort = 8420,
     [ValidateSet("S4U","System","Password","Interactive")]
     [string]$LogonType,
@@ -249,7 +268,8 @@ function Register-Job {
         [string]$Module,
         [string]$Description,
         $Trigger,
-        [string]$LogFile
+        [string]$LogFile,
+        $TimeLimit = (New-TimeSpan -Hours 6)
     )
 
     $action = New-Action -Exe $Python -Arguments "-m $Module" -LogFile $LogFile
@@ -259,7 +279,7 @@ function Register-Job {
         -DontStopIfGoingOnBatteries `
         -AllowStartIfOnBatteries `
         -MultipleInstances IgnoreNew `
-        -ExecutionTimeLimit (New-TimeSpan -Hours 6)
+        -ExecutionTimeLimit $TimeLimit
 
     Register-ScheduledTask -TaskName $Name -Action $action -Trigger $Trigger `
         -Settings $settings -Description $Description -Force @identityArgs | Out-Null
@@ -313,6 +333,38 @@ Register-Job -Name "BCSands-ChatInsights-Weekly" `
     -Description "Analyses the week's Chatbase conversations and emails the manager a report." `
     -Trigger (New-ScheduledTaskTrigger -Weekly -DaysOfWeek $WeeklyOn -At $WeeklyAt) `
     -LogFile (Join-Path $LogDir "scheduled_weekly_chat.log")
+
+# Every morning, and deliberately not dependent on Ollama: lead detection is
+# pure text/structure analysis, so this still works on a day the model server is
+# down. That matters -- these are the leads nobody else knows about.
+Register-Job -Name "BCSands-Leads-Daily" `
+    -Module "chat_insights.daily_leads" `
+    -Description "Captures chat leads (including ones Chatbase failed to forward) and emails the list." `
+    -Trigger (New-ScheduledTaskTrigger -Daily -At $LeadsAt) `
+    -LogFile (Join-Path $LogDir "scheduled_daily_leads.log")
+
+# Runs after the daily job, not before it: the images it has to verify are the
+# ones this morning's approvals just sent. Nothing is deleted until an image has
+# been read back off the product, so an early or missed run costs disk, never
+# a photo.
+Register-Job -Name "BCSands-ReclaimImages" `
+    -Module "scripts.reclaim_images" `
+    -Description "Verifies published product images against Odoo, then deletes the staged copies that landed." `
+    -Trigger (New-ScheduledTaskTrigger -Daily -At $ReclaimImagesAt) `
+    -LogFile (Join-Path $LogDir "scheduled_reclaim_images.log")
+
+# Around the clock, every few minutes. IgnoreNew (set in Register-Job) means a
+# slow run is never joined by a second one, and the ten-minute limit stops a
+# hung run from holding the slot. The job also takes its own lock, so a manual
+# "Check now" from the dashboard cannot overlap a scheduled run either.
+$siteMonitorTrigger = New-ScheduledTaskTrigger -Once -At (Get-Date).Date `
+    -RepetitionInterval (New-TimeSpan -Minutes $SiteMonitorEvery)
+Register-Job -Name "BCSands-SiteMonitor" `
+    -Module "site_monitor.run" `
+    -Description "Checks the online shop every few minutes and emails when a page is down, slow or showing a problem." `
+    -Trigger $siteMonitorTrigger `
+    -LogFile (Join-Path $LogDir "scheduled_site_monitor.log") `
+    -TimeLimit (New-TimeSpan -Minutes 10)
 
 # --- the things those jobs depend on ---------------------------------------
 

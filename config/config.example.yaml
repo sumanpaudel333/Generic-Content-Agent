@@ -94,12 +94,66 @@ approval_flow:
                                    # reproduce the draft that was already rejected
   regenerate_escalate_first: false # true = retries go straight to the stronger model
 
+# Reviewer-supplied product images. The reviewer attaches photos to a draft and
+# they are written to the platform in the same action as the description, so a
+# product does not go live with copy and no pictures.
+product_images:
+  enabled: true
+  max_files_per_product: 8        # how many photos one product can carry
+  max_file_mb: 8                  # per file; the platform does its own downscaling
+  retain_days_after_verify: 7     # keep the staged copy this long AFTER the image
+                                   # has been confirmed present on the product.
+                                   # 0 = reclaim as soon as it verifies
+
 # Weekly Chatbase conversation analysis, emailed to a manager. Optional --
 # set enabled: false if you have no chatbot to analyse.
 # Secrets and mail server details live in .env: CHATBASE_API_KEY, SMTP_HOST,
 # SMTP_PORT, SMTP_SECURITY, SMTP_USERNAME, SMTP_PASSWORD, SMTP_FROM, SMTP_FROM_NAME,
-# SMTP_RECIPIENTS,
 # SMTP_TLS_CA_FILE, SMTP_TLS_VERIFY.
+# ---------------------------------------------------------------------------
+# Where this dashboard is reachable. Only used to put working links into alert
+# emails -- override per environment with DASHBOARD_BASE_URL in .env.
+# ---------------------------------------------------------------------------
+dashboard:
+  base_url: ""
+
+# ---------------------------------------------------------------------------
+# Email: who receives what
+#
+# One list per mailing. There is no shared default and nothing falls back to
+# anything else -- an EMPTY LIST means that mailing is simply not sent, which
+# is how you switch one off.
+#
+#   Mailing         Goes out                            Typically to
+#   --------------- ----------------------------------- ---------------------
+#   weekly_report   Weekly, after the chat analysis     whoever reads the
+#                                                        analysis
+#   daily_leads     Every morning, the previous day's   sales -- it is a call
+#                   leads                                list
+#   lead_alerts     One per lead, the moment it is      sales, if you want
+#                   found (needs alert_on_leads: true)   instant notice
+#   job_failures    When a scheduled job fails          whoever looks after
+#                                                        the server
+#
+# Override any of them from .env with a comma-separated list:
+#   REPORT_RECIPIENTS  LEADS_RECIPIENTS  LEAD_ALERT_RECIPIENTS
+#   JOB_FAILURE_RECIPIENTS
+#
+# Mail SERVER settings -- host, port, credentials, TLS -- are a separate
+# concern and live in .env as SMTP_*. SMTP_RECIPIENTS is no longer read.
+# ---------------------------------------------------------------------------
+email:
+  recipients:
+    weekly_report:
+      []
+    daily_leads:
+      []
+    lead_alerts:
+      []
+    job_failures:
+      []
+
+
 chat_insights:
   enabled: false
   chatbase_agent_id: ""       # agent id -- NOT the API key. List them with:
@@ -117,8 +171,6 @@ chat_insights:
   max_analysis_tokens: 400
   min_user_messages_for_analysis: 1
   redact_email: true          # keep full transcripts locally, redact the email
-  # Fallback recipients. SMTP_RECIPIENTS in .env (comma-separated) wins.
-  report_recipients: []
 
   # Mail server defaults. The details actually used live in .env (SMTP_HOST,
   # SMTP_PORT, SMTP_SECURITY, SMTP_USERNAME, SMTP_PASSWORD, SMTP_FROM); anything
@@ -135,3 +187,76 @@ chat_insights:
   # encrypt without verifying. Overridden by SMTP_TLS_CA_FILE / SMTP_TLS_VERIFY.
   smtp_tls_ca_file: ""
   smtp_tls_verify: true
+
+  # Alerts, sent through the same mail server as the weekly report.
+  # A lead is emailed the moment it is detected: the CRM hand-off runs through
+  # a Chatbase action into Zapier and does not always fire, so this is the
+  # independent path that always does.
+  alert_on_leads: true
+
+  # --- Model-assisted lead extraction ------------------------------------
+  # The rules find phone numbers and emails reliably -- they have a shape.
+  # Names and the enquiry do not: "paul strachan", "but prefer" and "garden
+  # stakes" are the same shape, and telling them apart needs to know what the
+  # words mean. So a model gets a second pass over LEADS ONLY (a handful a
+  # day, not every conversation).
+  #
+  # It cannot make things worse. Everything it returns is checked back against
+  # the customer's own words -- a phone or email must be there digit for
+  # digit, a name must be there as text -- and anything that fails is dropped,
+  # leaving the rule-based result. If the model is down the lead is unchanged.
+  lead_extraction:
+    enabled: true
+    model: local            # local | claude
+    local_model: llama3.2:3b   # blank = chat_insights.model
+
+  # --- Daily lead digest -------------------------------------------------
+  # Runs every morning, independent of the weekly report. Detection is
+  # deterministic (no model), so this job does not need Ollama running.
+  leads_lookback_days: 3          # re-read a few days so a conversation that
+                                   # spans midnight is not missed
+  leads_email_when_empty: false   # false = a day with no leads sends no email
+  # Our OWN phone numbers and email addresses. The bot quotes the branch
+  # numbers in nearly every conversation, so without listing them here they
+  # get harvested as if a customer had given them. Derived config covers
+  # phone_display/phone_tel; add any other number the bot quotes.
+  own_contacts:
+    - "(02) 8543 3401"
+    - "(02) 9939 2077"
+    - "sales@bcsands.com.au"
+  # Both kinds carry contact details -- a chat with no phone or email is not
+  # recorded as a lead at all, since there would be nobody to follow up.
+  alert_lead_types: ["form_submission", "contact_shared"]
+  alert_on_job_failure: true
+
+# ---------------------------------------------------------------------------
+# Site monitor: checks the online shop every five minutes and emails when a
+# page goes down, slows down or shows a problem.
+#
+# These are STARTING values only. Once an admin saves settings on the
+# dashboard's Site health page, the saved values are used instead -- change
+# them there. The pages themselves are set on that page too. The scheduled
+# task BCSands-SiteMonitor runs the checks.
+#
+# The shop is checked two ways: "direct", through this server's own DNS,
+# straight to the shop server; and "public", through Cloudflare the way
+# customers reach it. The public check needs a Cloudflare rule that allows
+# office_ip -- without it, Cloudflare shows its bot check to the monitor.
+# ---------------------------------------------------------------------------
+site_monitor:
+  recipients:
+    - spaudel@bcsands.com.au
+  office_ip: "220.233.203.122"   # the address the Cloudflare allow rule names
+  quiet_hours:
+    start: "21:00"          # alerts are held from here...
+    end: "06:00"            # ...until here, and summarised at:
+  morning_summary_at: "06:30"
+  slow_ms: 3000             # a page slower than this is "slow"
+  slow_after: 3             # slow checks in a row before an alert
+  down_after: 2             # failed checks in a row before an alert
+  issue_after: 2            # wrong page, server error or bad certificate
+  blocked_after: 3          # Cloudflare bot check
+  reminder_minutes: 60      # while a page stays down
+  cert_warn_days: [21, 7]
+  timeout_seconds: 20
+  retention_days: 90

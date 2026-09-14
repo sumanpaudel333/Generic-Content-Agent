@@ -23,7 +23,7 @@ import re
 from collections import Counter
 from datetime import datetime, timezone
 
-from chat_insights import llm
+from chat_insights import llm, redact
 from config import settings
 
 logger = logging.getLogger("chat_insights.analyzer")
@@ -168,6 +168,218 @@ def analyse_conversation(conv: dict, *, model_fn=None) -> dict:
     return base
 
 
+# ---------------------------------------------------------------------------
+# Keywords -- what customers actually typed
+# ---------------------------------------------------------------------------
+# The category breakdown says a conversation was about "delivery". It cannot say
+# that nine people asked about delivery to one specific suburb, which is the
+# kind of thing that turns into a content change. This reads the customers' own
+# words to get at that.
+#
+# Deterministic on purpose: no model call, so it costs nothing on a CPU-only
+# host and cannot invent a theme that was not there.
+
+# Words that carry no signal in a retail chat. The chat-specific half matters
+# more than the grammatical half -- without it every week's top term is "hi".
+_STOPWORDS = frozenset("""
+a about after again all also am an and any are as at be because been before being
+below between both but by can cant cannot come could did do does doing dont down
+during each few for from further had has have having he her here hers him his how
+i if in into is it its itself just like me more most much my no nor not now of off
+on once only or other our out over own re s same she should so some such t than
+that the their them then there these they this those through to too under until up
+very was we were what when where which while who whom why will with would you your
+yours
+hi hey hello thanks thank please yes yep yeah ok okay okey sure cheers morning
+afternoon evening good great sorry excuse pardon bye goodbye regards
+want need know get got give tell ask say said looking look see want wanted need
+needed able help helped question questions
+im ive id ill youre thats whats theres lets dont doesnt isnt arent wasnt werent
+one two three back still going make made take took put use used
+per via plus etc else ever every anything something someone thing things
+way ways bit lot lots any many few kind sort maybe perhaps quite really
+wondering wonder interested interest possible possibly
+""".split())
+
+# Kept even though they are short or would otherwise be filtered -- these are the
+# units and sizes a building-supplies customer actually types.
+_KEEP_SHORT = frozenset({"m3", "m2", "kg", "mm", "cm", "gst", "ton", "bag", "bin"})
+
+_TOKEN_RE = re.compile(r"[a-z0-9][a-z0-9'\-]*")
+# Anything a redaction pass replaced. Their placeholder words must never become
+# keywords in their own right ("removed" would top every list).
+_MASK_WORDS = frozenset({"email", "phone", "address", "card", "number", "removed"})
+
+
+def _singular(word: str) -> str:
+    """Conservative de-pluralising, so "price" and "prices" are one keyword
+    rather than two half-sized ones.
+
+    Not a stemmer -- a real one would fold "delivery" into "deliveri" and make
+    the output unreadable. This only ever removes a trailing plural, and leaves
+    anything it is unsure about alone: "business" and "status" end in s and are
+    not plurals, so both are excluded by the ss/us/is check.
+    """
+    if len(word) <= 3 or not word.endswith("s"):
+        return word
+    if word.endswith(("ss", "us", "is")):
+        return word
+    if word.endswith("es") and word[:-2].endswith(("s", "x", "z", "ch", "sh")):
+        return word[:-2]
+    return word[:-1]
+
+
+# Pairs the plural rule cannot reach but that split a keyword in half every
+# week. Kept deliberately short: one entry per genuinely common split, not a
+# thesaurus.
+_SYNONYMS = {
+    "deliver": "delivery",
+    "delivered": "delivery",
+    "delivering": "delivery",
+    "pricing": "price",
+    "cost": "price",
+    "costs": "price",
+    "quote": "quote",
+    "quoted": "quote",
+    "available": "availability",
+    "avail": "availability",
+}
+
+
+def _normalise(word: str) -> str:
+    word = _singular(word)
+    return _SYNONYMS.get(word, word)
+
+
+def _customer_text(conv: dict) -> str:
+    """Only what the customer typed. The bot's replies are this system's own
+    output -- counting them would measure the script, not the demand."""
+    return " ".join((m.get("text") or "") for m in (conv.get("messages") or [])
+                    if (m.get("role") or "").lower() == "user")
+
+
+def _terms(text: str) -> set[str]:
+    """Unigrams and bigrams from one conversation, de-duplicated.
+
+    A set, not a count: the unit of interest is "how many people asked about
+    this", so one customer repeating themselves five times counts once.
+    """
+    # Redact first. A phone number split into tokens would otherwise surface as
+    # keywords, and this text ends up in an email.
+    cleaned = redact.redact(text or "").lower()
+    raw = _TOKEN_RE.findall(cleaned)
+
+    def usable(word: str) -> bool:
+        return ((len(word) > 2 or word in _KEEP_SHORT) and word not in _STOPWORDS
+                and not word.isdigit() and word not in _MASK_WORDS)
+
+    terms = {_normalise(w) for w in raw if usable(w)}
+    # Bigrams from ADJACENT words only, so dropping a stopword does not glue
+    # together two words the customer never put side by side.
+    for a, b in zip(raw, raw[1:]):
+        if usable(a) and usable(b):
+            terms.add(f"{_normalise(a)} {_normalise(b)}")
+    return terms
+
+
+def extract_keywords(conversations: list[dict], analyses: dict[str, dict], *,
+                      limit: int = 12, min_conversations: int = 2) -> list[dict]:
+    """Most-mentioned terms, with how many went unanswered.
+
+    That second number is the point of the section: a term customers raise often
+    AND that the bot keeps failing on is a content gap with demand attached,
+    which is exactly the list worth acting on.
+    """
+    per_term: Counter = Counter()
+    unanswered: Counter = Counter()
+    seen = 0
+
+    for conv in conversations:
+        text = _customer_text(conv)
+        if not text.strip():
+            continue
+        seen += 1
+        failed = bool((analyses.get(conv["id"]) or {}).get("bot_failed"))
+        for term in _terms(text):
+            per_term[term] += 1
+            if failed:
+                unanswered[term] += 1
+
+    if not per_term:
+        return []
+
+    # A bigram makes its parts redundant. "blue metal" appearing in nearly every
+    # conversation that says "metal" means listing both is noise, so the phrase
+    # wins and the loose word goes.
+    bigrams = [t for t in per_term if " " in t]
+    redundant: set[str] = set()
+    for bigram in bigrams:
+        for part in bigram.split(" "):
+            if per_term[part] and per_term[bigram] >= 0.6 * per_term[part]:
+                redundant.add(part)
+
+    ranked = [
+        {
+            "term": term,
+            "conversations": count,
+            "unanswered": unanswered[term],
+            "share": round(100 * count / seen) if seen else 0,
+        }
+        for term, count in per_term.items()
+        if count >= min_conversations and term not in redundant
+    ]
+    # Most-asked first; ties broken by how often the bot could not help, so the
+    # actionable one rises.
+    ranked.sort(key=lambda k: (k["conversations"], k["unanswered"]), reverse=True)
+    return ranked[:limit]
+
+
+# ---------------------------------------------------------------------------
+# Why the bot could not answer
+# ---------------------------------------------------------------------------
+# "17 unanswered" is one number covering three different problems, each owned
+# by a different person:
+#
+#   no_content    it said "I don't have that" -- nothing on the site covers it,
+#                 so the fix is to write the page
+#   weak_context  it answered from something barely relevant -- the page exists
+#                 but is too thin to match, so the fix is to improve it
+#   deflected     it chose not to answer and pushed the customer to phone --
+#                 that is bot configuration, not content
+#   other         abandoned, repeated, or explicitly disliked
+#
+# Derived from the stored reason string rather than recorded at detection time,
+# so it works on analyses that were cached before this existed -- re-running the
+# week is not required to get the breakdown.
+FAILURE_KINDS = ("no_content", "weak_context", "deflected", "other")
+
+FAILURE_KIND_LABELS = {
+    "no_content": "Nothing on the site covers it",
+    "weak_context": "Answered from a page too thin to match",
+    "deflected": "Told the customer to phone instead",
+    "other": "Abandoned, repeated, or disliked",
+}
+
+FAILURE_KIND_ACTIONS = {
+    "no_content": "Write the page. These are the products to draft next.",
+    "weak_context": "The page exists but does not answer the question -- add the detail.",
+    "deflected": "Bot configuration, not content: it had the answer and chose not to give it.",
+    "other": "Read the transcript; no single fix applies.",
+}
+
+
+def classify_failure(reason: str) -> str:
+    """One of FAILURE_KINDS from a stored failure_reason string."""
+    text = (reason or "").lower()
+    if "weak context" in text:
+        return "weak_context"
+    if "get in touch" in text or "contact us" in text or "give us a call" in text:
+        return "deflected"
+    if "i don" in text or "do not have" in text or "not sure" in text or "cannot find" in text:
+        return "no_content"
+    return "other"
+
+
 def aggregate(conversations: list[dict], analyses: dict[str, dict]) -> dict:
     """Rolls per-conversation results into the report's numbers. Pure Python --
     no model involved."""
@@ -209,6 +421,10 @@ def aggregate(conversations: list[dict], analyses: dict[str, dict]) -> dict:
         if a.get("sentiment") == "negative" or (conv.get("negative_feedback") or 0) > 0:
             unhappy.append(entry)
 
+    # Split the failures by what would actually fix them. One count of 17 sends
+    # nobody anywhere; three counts route to three different jobs.
+    failure_kinds = Counter(classify_failure(f.get("reason", "")) for f in failures)
+
     busiest_day, busiest_count = (per_day.most_common(1)[0] if per_day else ("--", 0))
     resolved_count = sum(1 for c in conversations
                           if (analyses.get(c["id"]) or {}).get("resolved"))
@@ -230,6 +446,11 @@ def aggregate(conversations: list[dict], analyses: dict[str, dict]) -> dict:
         "failures": sorted(failures, key=lambda e: e.get("created_at") or 0, reverse=True),
         "leads": sorted(leads, key=lambda e: e.get("created_at") or 0, reverse=True),
         "unhappy": sorted(unhappy, key=lambda e: e.get("created_at") or 0, reverse=True),
+        # Computed here rather than in the reporter so it lands in stats_json --
+        # a report re-sent weeks later shows the same keywords it did first time.
+        "keywords": extract_keywords(conversations, analyses),
+        "failure_kinds": {k: failure_kinds.get(k, 0) for k in FAILURE_KINDS
+                           if failure_kinds.get(k)},
     }
 
 
