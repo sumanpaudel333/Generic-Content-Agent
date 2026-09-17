@@ -131,6 +131,22 @@ _MIGRATION_COLUMNS = [
     # When the model last refined this lead's details. Its presence is what
     # stops sync() paying for the same extraction on every run.
     ("leads", "extracted_at", "TEXT"),
+    # How long the conversation was when the model read it. A chat still going
+    # when it was first seen -- the customer gives their number, then their
+    # name -- is read once more when it has grown, and never again after that.
+    ("leads", "extracted_message_count", "INTEGER"),
+    # Lead email runs happen several times a day now, each covering the time
+    # since the previous scheduled one, so a run is described by its window
+    # rather than by a calendar day. See chat_insights/daily_leads.py.
+    ("lead_digests", "slot", "TEXT"),             # "09:00" for a scheduled run, else blank
+    ("lead_digests", "window_start_at", "TEXT"),  # UTC ISO
+    ("lead_digests", "window_end_at", "TEXT"),    # UTC ISO
+    ("lead_digests", "is_test", "INTEGER DEFAULT 0"),
+    ("lead_digests", "refined", "INTEGER DEFAULT 0"),   # leads the model tidied this run
+    ("lead_digests", "deferred", "INTEGER DEFAULT 0"),  # left for the next run: time budget
+    ("lead_digests", "carried", "INTEGER DEFAULT 0"),   # leads from before the window, never emailed
+    ("lead_digests", "duration_ms", "INTEGER"),
+    ("lead_digests", "timings", "TEXT"),                # JSON: fetch, scan, model, email
 ]
 
 
@@ -187,6 +203,8 @@ _POST_MIGRATION_SCHEMA = """
 CREATE INDEX IF NOT EXISTS idx_leads_digested ON leads(digested_at);
 CREATE INDEX IF NOT EXISTS idx_leads_handoff ON leads(handoff_state);
 CREATE INDEX IF NOT EXISTS idx_lead_digests_day ON lead_digests(day_end);
+CREATE INDEX IF NOT EXISTS idx_lead_digests_window ON lead_digests(window_end_at);
+CREATE INDEX IF NOT EXISTS idx_conversations_created ON conversations(created_at);
 """
 
 
@@ -406,8 +424,9 @@ def upsert_lead(lead: dict) -> None:
             """INSERT INTO leads
                (conversation_id, run_id, created_at, detected_at, lead_type, category,
                 topic, detail, contact_name, contact_email, contact_phone, contact_source,
-                handoff_state, handoff_detail, claim_excerpt, extracted_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                handoff_state, handoff_detail, claim_excerpt, extracted_at,
+                extracted_message_count)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                ON CONFLICT(conversation_id) DO UPDATE SET
                  run_id=excluded.run_id, created_at=excluded.created_at,
                  lead_type=excluded.lead_type, category=excluded.category,
@@ -423,14 +442,17 @@ def upsert_lead(lead: dict) -> None:
                  claim_excerpt=excluded.claim_excerpt,
                  -- Never clear it: a later rules-only sync must not make the
                  -- lead look un-refined and buy the model call again.
-                 extracted_at=COALESCE(excluded.extracted_at, leads.extracted_at)""",
+                 extracted_at=COALESCE(excluded.extracted_at, leads.extracted_at),
+                 extracted_message_count=COALESCE(excluded.extracted_message_count,
+                                                  leads.extracted_message_count)""",
             (lead["conversation_id"], lead.get("run_id"), lead.get("created_at"), _now(),
              lead.get("lead_type"), lead.get("category"), lead.get("topic"),
              lead.get("detail"), lead.get("contact_name"), lead.get("contact_email"),
              lead.get("contact_phone"), lead.get("contact_source"),
              lead.get("handoff_state"), lead.get("handoff_detail"),
              lead.get("claim_excerpt"),
-             _now() if lead.get("extracted") else None),
+             _now() if lead.get("extracted") else None,
+             lead.get("extracted_message_count") if lead.get("extracted") else None),
         )
 
 
@@ -572,6 +594,68 @@ def leads_in_window(start_epoch: int, end_epoch: int) -> list[dict]:
         return [dict(r) for r in rows]
 
 
+def leads_to_email(window_start_epoch: int, window_end_epoch: int,
+                   carry_since_epoch: int) -> list[dict]:
+    """What one lead email run sends, most urgent first.
+
+    Every lead from a chat that started inside the run's window and has not
+    been emailed yet -- plus any not-yet-emailed lead from a chat that started
+    in the day before the window. That second part covers two real cases:
+
+      * a customer who started chatting just before a run and left their number
+        just after it, so the lead did not exist yet when its own window ran;
+      * a run whose email failed, or that never ran, so its leads were never
+        sent. They go in the next email instead of being lost.
+
+    Bounded to a day so a backlog from before this existed is not suddenly
+    emailed to the sales team in one go.
+    """
+    init_db()
+    with _connect() as conn:
+        rows = conn.execute("""
+            SELECT * FROM leads
+            WHERE digested_at IS NULL
+              AND created_at >= ? AND created_at < ?
+            ORDER BY CASE handoff_state
+                       WHEN 'claimed_not_fired' THEN 0
+                       WHEN 'no_claim'          THEN 1
+                       WHEN 'fired'             THEN 2
+                       ELSE 3 END,
+                     created_at ASC""",
+            (int(min(carry_since_epoch, window_start_epoch)), int(window_end_epoch)))
+        return [dict(r) for r in rows]
+
+
+def list_conversations_since(since_epoch: int) -> list[dict]:
+    """Stored conversations that started at or after `since_epoch`, newest first."""
+    init_db()
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT * FROM conversations WHERE created_at >= ? ORDER BY created_at DESC",
+            (int(since_epoch),)).fetchall()
+        return [_conv_to_dict(r) for r in rows]
+
+
+def lead_runs_between(start_iso: str, end_iso: str) -> list[dict]:
+    """Lead email runs whose window ended in [start, end), newest first."""
+    init_db()
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT * FROM lead_digests WHERE window_end_at >= ? AND window_end_at < ? "
+            "ORDER BY window_end_at DESC, id DESC", (start_iso, end_iso)).fetchall()
+    return [dict(r) for r in rows]
+
+
+def earliest_slot_run() -> str | None:
+    """window_end_at of the first scheduled-style run ever recorded, or None."""
+    init_db()
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT MIN(window_end_at) AS first FROM lead_digests "
+            "WHERE slot IS NOT NULL AND slot != '' AND COALESCE(is_test, 0) = 0").fetchone()
+    return row["first"] if row and row["first"] else None
+
+
 def leads_for_digest(*, include_digested: bool = False) -> list[dict]:
     """Every lead still open, most urgent first.
 
@@ -628,7 +712,9 @@ def mark_lead_alerted(conversation_id: str) -> None:
 
 _DIGEST_FIELDS = ("day_start", "day_end", "day_label", "ran_at", "run_trigger",
                   "triggered_by", "fetched", "reported", "waiting",
-                  "email_status", "email_detail", "recipients", "subject", "error")
+                  "email_status", "email_detail", "recipients", "subject", "error",
+                  "slot", "window_start_at", "window_end_at", "is_test", "refined",
+                  "deferred", "duration_ms", "timings", "carried")
 
 
 def record_lead_digest(entry: dict) -> int:

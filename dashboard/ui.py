@@ -36,6 +36,7 @@ MODULES: list[dict[str, Any]] = [
         "path": "/content-agent",
         "status": "live",
         "icon": "doc",
+        "permission": "view_content",
         "blurb": "Writes product descriptions for you and puts each one in a queue "
                   "to be checked. Nothing reaches the website until someone here "
                   "approves it.",
@@ -46,6 +47,7 @@ MODULES: list[dict[str, Any]] = [
         "path": "/chat-insights",
         "status": "live",
         "icon": "chat",
+        "permission": "view_chat",
         "blurb": "Reads the week's website chats and tells you what customers asked "
                   "about, which questions the chatbot could not answer, and who left "
                   "their details wanting a call back.",
@@ -56,6 +58,7 @@ MODULES: list[dict[str, Any]] = [
         "path": "/site-health",
         "status": "live",
         "icon": "pulse",
+        "permission": "view_site_health",
         "blurb": "Checks the online shop every five minutes and emails you when a "
                   "page goes down, slows down or shows an error.",
     },
@@ -69,8 +72,12 @@ MODULES: list[dict[str, Any]] = [
     },
 ]
 
+# "permission" is the auth permission needed to open the module; the sidebar and
+# the overview leave out anything the signed-in user lacks. Those names must match
+# dashboard/auth.py -- plain strings here so this module does not import auth.
 NAV_ITEMS = [{"key": "overview", "label": "Overview", "path": "/", "icon": "grid"}] + [
-    {"key": m["key"], "label": m["label"], "path": m["path"], "icon": m.get("icon", "")}
+    {"key": m["key"], "label": m["label"], "path": m["path"], "icon": m.get("icon", ""),
+     "permission": m.get("permission", "")}
     for m in MODULES if m["status"] == "live"
 ]
 
@@ -1240,7 +1247,10 @@ def _sidebar_html(active_module: str, user: dict | None, current_path: str = "")
         return (f'<a href="{item["path"]}" class="{"active" if is_active else ""}"{current}>'
                 f'{icon(item.get("icon", ""))}<span>{_esc(item["label"])}</span></a>')
 
-    links = "".join(link(i, i["key"] == active_module) for i in NAV_ITEMS)
+    from dashboard import auth
+
+    links = "".join(link(i, i["key"] == active_module) for i in NAV_ITEMS
+                    if not i.get("permission") or auth.can(user, i["permission"]))
     if user and user.get("role") == "admin":
         # Matched on the URL, not on active_module. These four share the
         # /settings prefix, so a single active_module=="settings" flag lit all
@@ -1257,7 +1267,7 @@ def _sidebar_html(active_module: str, user: dict | None, current_path: str = "")
             <div class="avatar">{_esc(initials(name))}</div>
             <div>
                 <div class="uname">{_esc(name)}</div>
-                <div class="urole">{_esc(user.get("role", ""))}</div>
+                <div class="urole">{_esc(auth.role_label(user.get("role")))}</div>
             </div>
             <form method="post" action="/logout" style="margin:0">
                 <button class="logout-btn" type="submit"

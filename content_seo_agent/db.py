@@ -91,6 +91,7 @@ AUDIT_ACTIONS = (
     "approved", "rejected", "edited", "published", "publish_failed",
     "reopened", "regenerated", "user_created", "user_disabled", "user_enabled",
     "password_reset", "images_added", "images_removed", "images_reclaimed",
+    "descriptions_exported",
 )
 
 

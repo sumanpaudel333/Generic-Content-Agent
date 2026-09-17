@@ -244,6 +244,32 @@ CHAT_LEAD_EXTRACT_MODEL = str(_extract_cfg.get("model", "claude") or "claude")
 CHAT_LEAD_EXTRACT_LOCAL_MODEL = str(_extract_cfg.get("local_model", "") or "")
 
 CHAT_LEADS_LOOKBACK_DAYS = max(1, int(_chat_cfg.get("leads_lookback_days", 3)))
+
+
+def _schedule(values) -> list[str]:
+    """HH:MM strings, sorted and de-duplicated; bad entries are dropped rather
+    than stopping the dashboard, and an empty result falls back to the default."""
+    out = set()
+    for value in values or []:
+        text = str(value).strip()
+        try:
+            hour, minute = (int(part) for part in text.split(":"))
+        except ValueError:
+            continue
+        if 0 <= hour < 24 and 0 <= minute < 60:
+            out.add(f"{hour:02d}:{minute:02d}")
+    return sorted(out)
+
+
+# When the lead email job runs, in Australian Eastern time. Each run emails the
+# leads from chats since the one before. Must match the triggers on the
+# BCSands-Leads scheduled task -- see scripts/register_scheduled_tasks.ps1.
+CHAT_LEADS_DEFAULT_SCHEDULE = ["04:00", "09:00", "11:00", "13:00", "16:00"]
+CHAT_LEADS_SCHEDULE = (_schedule(_chat_cfg.get("leads_schedule"))
+                       or list(CHAT_LEADS_DEFAULT_SCHEDULE))
+# Most time the lead model may spend in one run. Leads past it are emailed with
+# the rules' details and tidied next run.
+CHAT_LEAD_MODEL_BUDGET_SECONDS = max(0, int(_chat_cfg.get("lead_model_budget_seconds", 180)))
 CHAT_LEADS_RECIPIENTS = MAIL_RECIPIENTS["daily_leads"]
 CHAT_LEADS_EMAIL_WHEN_EMPTY = bool(_chat_cfg.get("leads_email_when_empty", False))
 # Which lead types are worth an email. Both are, by default: every lead on the

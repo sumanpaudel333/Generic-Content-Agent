@@ -9,7 +9,7 @@
     Scheduled jobs -- run, do their work, exit:
       * BCSands-ContentAgent-Daily  -- content_seo_agent/daily_run.py, once a day
       * BCSands-ChatInsights-Weekly -- chat_insights/weekly_run.py, once a week
-      * BCSands-Leads-Daily         -- chat_insights/daily_leads.py, every morning
+      * BCSands-Leads               -- chat_insights/daily_leads.py, five times a day
       * BCSands-ReclaimImages       -- scripts/reclaim_images.py, once a day
       * BCSands-SiteMonitor         -- site_monitor/run.py, every few minutes
 
@@ -68,8 +68,11 @@
     Time of day for the content job. Default 1:00.
 
 .PARAMETER LeadsAt
-    Time of day for the daily lead digest. Default 07:30 -- before the sales
-    team starts, so the list is waiting rather than arriving mid-morning.
+    Times of day for the lead email job, every day. Default 04:00, 09:00, 11:00,
+    13:00 and 16:00. Each run emails the leads from chats since the run before,
+    so the 04:00 run carries the evening and night. Must match
+    chat_insights.leads_schedule in config/config.yaml, which the dashboard uses
+    to tell whether a run was missed. Pass several as -LeadsAt 04:00,09:00,...
 
 .PARAMETER ReclaimImagesAt
     Time of day for the image cleanup job. Default 23:00 -- after the day's
@@ -142,7 +145,7 @@
 [CmdletBinding()]
 param(
     [string]$DailyAt = "1:11",
-    [string]$LeadsAt = "04:00",
+    [string[]]$LeadsAt = @("04:00", "09:00", "11:00", "13:00", "16:00"),
     [string]$ReclaimImagesAt = "00:10",
     [ValidateRange(1, 60)]
     [int]$SiteMonitorEvery = 5,
@@ -334,14 +337,25 @@ Register-Job -Name "BCSands-ChatInsights-Weekly" `
     -Trigger (New-ScheduledTaskTrigger -Weekly -DaysOfWeek $WeeklyOn -At $WeeklyAt) `
     -LogFile (Join-Path $LogDir "scheduled_weekly_chat.log")
 
-# Every morning, and deliberately not dependent on Ollama: lead detection is
-# pure text/structure analysis, so this still works on a day the model server is
-# down. That matters -- these are the leads nobody else knows about.
-Register-Job -Name "BCSands-Leads-Daily" `
+# Several times a day, one trigger per time. Not dependent on Ollama: leads are
+# found by text matching, and the model only tidies names on leads already
+# found, so a day the model server is down still sends every lead -- these are
+# the ones nobody else knows about. A run takes seconds; the 30-minute limit
+# only stops a hung one holding the lock.
+$leadsTriggers = @($LeadsAt | ForEach-Object { New-ScheduledTaskTrigger -Daily -At $_ })
+Register-Job -Name "BCSands-Leads" `
     -Module "chat_insights.daily_leads" `
-    -Description "Captures chat leads (including ones Chatbase failed to forward) and emails the list." `
-    -Trigger (New-ScheduledTaskTrigger -Daily -At $LeadsAt) `
-    -LogFile (Join-Path $LogDir "scheduled_daily_leads.log")
+    -Description "Fetches new chats, finds leads (including ones Chatbase failed to forward) and emails the call list, at $($LeadsAt -join ', ') every day." `
+    -Trigger $leadsTriggers `
+    -LogFile (Join-Path $LogDir "scheduled_daily_leads.log") `
+    -TimeLimit (New-TimeSpan -Minutes 30)
+
+# The once-a-morning task it replaces. Left registered, it would send a second
+# email covering the same leads at its old time.
+if (Get-ScheduledTask -TaskName "BCSands-Leads-Daily" -ErrorAction SilentlyContinue) {
+    Unregister-ScheduledTask -TaskName "BCSands-Leads-Daily" -Confirm:$false
+    Write-Host "  removed old job    : BCSands-Leads-Daily"
+}
 
 # Runs after the daily job, not before it: the images it has to verify are the
 # ones this morning's approvals just sent. Nothing is deleted until an image has

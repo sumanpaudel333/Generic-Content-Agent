@@ -246,23 +246,29 @@ The People page is a card per person rather than a table row: a name, an email a
 
 **Layout.** The dashboard is the *Content and Automation Dashboard*: a left sidebar listing every automation, with the work filling the rest of the window. **Content Agent** is the first: its To check / Did not send / Turned down / Done tabs are the human checkpoint described above. To add another automation, register it in `MODULES` in `dashboard/ui.py` (label, path, icon and a one-line description) and add its routes in `dashboard/app.py` -- navigation, theming, and auth come from the shell.
 
-**Two roles, and what separates them.** A **reviewer** reviews: they read the queue, edit a description, approve it, turn it down, send it to the product, ask for one item to be written again, and work the lead list. An **admin** does all of that plus everything else.
+**Three roles, and what separates them.** A **reviewer** reviews: they read the queue, edit a description, approve it, turn it down, send it to the product, ask for one item to be written again, and work the lead list. **Sales** is for the sales team: they work the lead list -- check for leads, open the chat behind each one, set its status as they follow it up -- and can read Chat Insights and Site health, but have no part in product descriptions. An **admin** does everything.
 
-What a reviewer cannot do is start a job or send mail:
+| | Sales | Reviewer | Admin |
+|---|---|---|---|
+| Open the Content Agent | no | yes | yes |
+| Approve, turn down, edit, publish | no | yes | yes |
+| Rewrite a single description | no | yes | yes |
+| Fetch a batch of new products | no | no | yes |
+| Rewrite every turned-down description | no | no | yes |
+| Open Chat Insights: reports, transcripts, the lead list | yes | yes | yes |
+| Set a lead's status | yes | yes | yes |
+| Check for leads (finds them; sends no alert email) | yes | yes | yes |
+| Run the weekly chat analysis | no | no | yes |
+| Email a report, send the lead email now | no | no | yes |
+| See which lead emails went out | no | no | yes |
+| See the Setup read-out on Chat Insights | no | no | yes |
+| Open Site health | yes | yes | yes |
+| Change Site health settings, check now, send a test alert | no | no | yes |
+| People, job history, activity log, photo storage | no | no | yes |
 
-| | Reviewer | Admin |
-|---|---|---|
-| Approve, turn down, edit, publish | yes | yes |
-| Rewrite a single description | yes | yes |
-| Fetch a batch of new products | no | yes |
-| Rewrite every turned-down description | no | yes |
-| Run the weekly chat analysis | no | yes |
-| Email a report, send the morning lead list | no | yes |
-| Check for leads | yes | yes |
-| Read chat transcripts | yes | yes |
-| See which lead emails went out | no | yes |
-| See the Setup read-out on Chat Insights | no | yes |
-| People, job history, activity log, photo storage | no | yes |
+**Email, jobs and settings are admin-only, and that is enforced twice.** Every route that sends email, starts a job, or changes a setting or a person checks for an admin-only permission itself. And `ADMIN_ONLY_PERMISSIONS` in `dashboard/auth.py` is checked as the dashboard starts: if an edit to the permission table ever gives one of those to another role, the dashboard refuses to start and says why, rather than quietly handing it out. The whole `/settings` section is locked to admins as well.
+
+**Sales does not see the Content Agent.** It is left out of their sidebar and their overview, and its addresses send them back to the overview. That is enforced for whole sections at once: `SECTION_PERMISSIONS` in `dashboard/app.py` maps each part of the dashboard to the permission needed to open it, and the sign-in check applies it to every address underneath -- pages, forms and downloads alike -- before any route runs. So a section stays shut even for a route written before this role existed that never checked for itself.
 
 The line is drawn at actions that reach outside the dashboard and cannot be taken back. A batch run ties up the machine for as long as it takes and cannot be stopped from a browser; an email is gone the moment the relay accepts it. All of those also have scheduled counterparts, so a reviewer pressing one is usually repeating work that already happened overnight rather than fixing anything. Rewriting *one* description stays with the reviewer, because that is the recourse for a bad draft in front of them, not a batch.
 
@@ -547,18 +553,40 @@ whether one sits immediately before the sentence claiming it.
 No model is involved -- this is a structural property of the message list. That
 keeps the daily job fast and means it still works on a day Ollama is down.
 
-### The daily lead email
+### The lead emails
 
 Separate from the weekly report on purpose: a customer promised a callback
-cannot wait until Thursday. `BCSands-Leads-Daily` runs every morning (07:30 by
-default) and emails the sales team **the previous day's leads** -- the ones the
-chatbot failed to forward and the ones it forwarded, in one list.
+cannot wait until Thursday. `BCSands-Leads` runs **five times a day -- 4:00 am,
+9:00 am, 11:00 am, 1:00 pm and 4:00 pm, Sydney time** -- and each run fetches the
+latest chats from Chatbase, finds the leads, and emails the sales team **one
+call list with every lead from the chats since the run before**: the ones the
+chatbot failed to forward and the ones it forwarded, together.
 
-It reports a whole day, local midnight to midnight, not the last 24 hours. Run
-at 07:30 on Tuesday it covers all of Monday: a period somebody can name, and one
-that does not split Monday evening's enquiries across two emails. It fetches a
-day wider than it reports, so a chat that started before midnight and ran past
-it still lands in the right day.
+| Run | Covers chats that started |
+|---|---|
+| 4:00 am | 4:00 pm the day before to 4:00 am -- the evening and night, waiting before work starts |
+| 9:00 am | 4:00 am to 9:00 am |
+| 11:00 am | 9:00 am to 11:00 am |
+| 1:00 pm | 11:00 am to 1:00 pm |
+| 4:00 pm | 1:00 pm to 4:00 pm |
+
+No leads in a window, no email. A lead is never emailed twice. Two kinds of lead
+are carried into the next email rather than lost: a chat that started just
+before a run and only got its phone number after it, and the leads from a run
+whose email failed or that never ran. That carry-over reaches back one day, so a
+backlog from before this existed is not suddenly emailed. A run the scheduler
+starts late still reports its own window -- the 9:00 run started at 10:20 covers
+4:00 to 9:00, and 9:00 onwards waits for 11:00.
+
+A run takes a few seconds: two Chatbase calls, and text matching over the last
+day or two of chats. Measured on this server with real data: 2.4 s. A lock stops
+the scheduled job, "Check for leads" and "Send lead email now" overlapping; a run
+that finds it held is recorded as skipped, and its leads go out with the next.
+
+The times live in `chat_insights.leads_schedule` in `config.yaml` **and** on the
+scheduled task's triggers (`-LeadsAt` in `scripts/register_scheduled_tasks.ps1`).
+Change both together: the dashboard uses the first to tell whether a run was
+missed.
 
 **The email carries no technical detail.** It goes to people holding a phone, so
 each lead is four fields and a link:
@@ -579,17 +607,18 @@ question and unhappy customer the same way.
 
 ### Knowing the email went
 
-Every run of the morning job writes a row: the day it covered, how many leads
-were in it, what happened to the email, who it went to, and whether Task
-Scheduler or a person started it. **Chat Insights -> Leads -> Morning lead
-emails** lays the last fortnight out one day per row.
+Every run writes a row: the window it covered, how many leads were in it, what
+happened to the email, who it went to, how long it took, and whether Task
+Scheduler or a person started it. **Chat Insights -> Leads -> Lead emails**
+(admins) lays out today's and yesterday's runs one slot per row, with any run a
+person started in between.
 
-The reason is a failure mode the inbox cannot show you. A morning where the job
-did not fire looks exactly like a morning with no leads -- in both cases nothing
-arrives. The difference matters: one means nobody needs calling, the other means
-somebody does and nobody knows. Laying the days out makes the gap visible, and
-the page names the dates rather than counting them, because a date is something
-you can go and cover.
+The reason is a failure mode the inbox cannot show you. A run that did not fire
+looks exactly like a run with no leads -- in both cases nothing arrives. The
+difference matters: one means nobody needs calling, the other means somebody
+does and nobody knows. A slot with no run 30 minutes after its time is shown as
+**Did not run** and named at the top of the panel, because a time is something
+you can go and check.
 
 The outcome is recorded as one of five, not as success or failure:
 
@@ -605,30 +634,38 @@ Three of those are the mailing working exactly as configured. Collapsing them
 into "failed" would have Task Scheduler report a broken job most mornings, and
 paint the page red on a quiet Sunday -- which is how a warning gets ignored.
 
-Days before the first recorded run show as **Not tracked** rather than missed.
-Nothing failed then; this simply was not recording yet. Without that distinction
-the feature would announce a fortnight of failures the morning it shipped.
+Slots before the first recorded run show as **Not tracked** rather than missed.
+Nothing failed then; this simply was not recording yet. The job's failure alert
+goes out once per problem, not at every run while it lasts.
 
 ### Running it by hand
 
-**Send the morning email**, on the same page, runs the whole job now: fetch,
-detect, email. It does exactly what the scheduled task does and is recorded the
-same way, marked as a manual run against whoever pressed it.
+**Check for leads** (Sales, reviewers, admins) fetches the latest chats from
+Chatbase and finds the leads, in the background -- the page refreshes itself and
+then says how it went. It sends no lead email.
 
-It exists because of who is affected when the scheduled task does not fire. The
-people waiting on those leads are the sales team, and before this they had to
-find somebody with a server login to get their morning list. Now they can cover
-the day themselves.
+**Send lead email now** (admins) runs the whole job: fetch, find, email every lead
+since the last scheduled run that has not been emailed yet. Recorded like a
+scheduled run, marked as by hand. Safe to press twice: leads already sent are
+not sent again.
 
-Safe to press twice -- the same leads simply go out again. It runs in the
-background and takes a few seconds to a minute depending on how much Chatbase
-has to hand back, so the page says to refresh rather than appearing to hang.
-
-From a terminal, the same thing:
+From a terminal:
 
 ```bash
-python -m chat_insights.daily_leads
+python -m chat_insights.daily_leads                 # the job: window since the last scheduled time
+python -m chat_insights.daily_leads --slot 09:00    # re-run a scheduled window, e.g. a missed one
+python -m chat_insights.daily_leads --dry-run       # see the email without fetching or sending
+python -m chat_insights.daily_leads --no-fetch      # use stored chats only
 ```
+
+### Test panel (temporary)
+
+At the bottom of **Chat Insights -> Leads**, admins have **Test the lead run**:
+pick a window (any of today's or yesterday's runs, or since the last scheduled
+time), choose preview or email-to-me, and it runs the real thing and shows each
+step's time and the email itself. A test never emails the sales team, never
+marks a lead as emailed, and is not counted as a scheduled run. It is marked
+TEMPORARY in `dashboard/app.py` with instructions for taking it out.
 
 ### Getting the details right
 
@@ -663,10 +700,22 @@ lead comes out as the rules found it.
 unchanged if the model is off, down, slow or wrong. The daily job still works
 with Ollama stopped.
 
-**It is paid for once.** A conversation's transcript never changes once it has
-ended, so the extraction is cached on the lead (`extracted_at`) and later syncs
-skip it. Without that, every sync -- the daily job *and* the dashboard's Sync
-button -- re-ran the model over the whole back catalogue.
+**It only ever sees leads.** The check for a phone number or email comes first,
+and a chat without one never reaches the model. That order was once the other
+way round, so every stored chat went to the model on every run -- 168 non-lead
+chats at about 9 seconds each, 24 minutes a morning and growing daily. Now a run
+with no new lead spends no model time at all, and each new lead about 20
+seconds.
+
+**It is paid for once.** The extraction is cached on the lead (`extracted_at`,
+with the chat's length at the time) and later runs skip it -- unless the chat has
+grown since, because a customer often gives their number first and their name a
+message later, and a lead caught mid-conversation is read once more.
+
+**It has a time budget.** `lead_model_budget_seconds` (default 180) caps the
+model's time in one run. Leads past it are emailed on time with the rules'
+details and tidied by the next run. When the model is off or skipped, the
+Inquiry line is the customer's first real message, so it is never blank.
 
 ```yaml
 chat_insights:
@@ -700,21 +749,19 @@ the forwarding step fired is our problem to fix, not something a salesperson can
 act on -- that detail stays on the lead record and is shown in the dashboard,
 where someone debugging the chatbot will look for it.
 
-Each email is that day's leads; it does not carry unactioned ones forward. The
+Each email is its window's leads; it does not repeat leads already sent. The
 running list of everything still open is in the dashboard under **Chat Insights
--> Leads**. If you would rather the email repeated the last few days each
-morning, raise `leads_lookback_days`.
-
-```bash
-python -m chat_insights.daily_leads --dry-run     # see the digest without sending
-python -m chat_insights.daily_leads --no-fetch    # re-detect over stored conversations
-python -m chat_insights.daily_leads               # the real job
-```
+-> Leads**.
 
 Phone numbers are `tel:` links and emails are `mailto:` links, because this is
 read on a phone by someone about to make the call.
 
-`alert_on_leads` is **off**: the morning digest is the one lead mailing. Turning
+**Times are Australian Eastern everywhere.** Every page and email shows times in
+Sydney time with the zone (`Thu 17 Sep 2026, 9:05 am AEST`, `AEDT` in daylight
+saving), whatever the server's own clock is set to. Everything is still stored in
+UTC; the conversion happens only for display, in `config/localtime.py`.
+
+`alert_on_leads` is **off**: the scheduled lead emails are the one lead mailing. Turning
 it back on adds a second email per lead, sent the moment it is detected.
 
 With `leads_email_when_empty: false` a day with no leads sends **no email at
@@ -740,8 +787,9 @@ alert_on_leads: false         # the daily digest is the lead mailing now
 alert_lead_types: ["form_submission", "contact_shared"]
 alert_on_job_failure: true
 
-leads_lookback_days: 1        # 1 = yesterday. Raise it to repeat recent days
-leads_email_when_empty: true  # a quiet day is still worth confirming
+leads_schedule: ["04:00", "09:00", "11:00", "13:00", "16:00"]   # Sydney time
+leads_email_when_empty: false # a window with no leads sends nothing
+lead_model_budget_seconds: 180
 leads_recipients: []          # blank = same recipients as the weekly report
 own_contacts:                 # OUR numbers, so they are never read as a customer's
   - "(02) 8543 3401"
@@ -916,11 +964,29 @@ accepted that were **not** on the product when read back -- where a reviewer
 believes the job is done and it is not. Those keep their local copies; re-publish
 the queue row, or check the product in Odoo.
 
+## Exporting approved descriptions
+
+Admins can download approved descriptions from **Content Agent -> Done**. The file has one product per row with three columns: **SKU**, **Product name** and **Description**. Reviewers do not see the download, and the address refuses them if they type it in.
+
+| Option | Choices |
+|---|---|
+| Which | All approved, only those published to Odoo, or only those approved but not yet published |
+| Description as | Plain text (paragraphs, headings and bullets, readable in Excel) or HTML exactly as sent to Odoo |
+| File | Excel (.xlsx) or CSV |
+
+The description is the one that goes to the product page, including the delivery and disclaimer lines. A published product uses the exact HTML that was sent to Odoo. A product approved but not yet sent is put together the same way publishing would. Approved rows with nothing written, such as classification-only rows, are left out.
+
+Spreadsheet programs treat a cell starting with `=` as a formula. The Excel file stores every cell as text, so nothing runs. A CSV cannot mark cells as text, so a CSV cell that could be read as a formula starts with an apostrophe. CSV files are saved as UTF-8 with a byte-order mark so Excel shows characters like "m³" and "•" correctly. Every download is recorded in the activity log as "Exported descriptions", with what was chosen and how many rows.
+
 ## Site health
 
 The dashboard watches the online shop and emails when a page goes down, slows down or shows a problem. **Site health** in the sidebar shows each page's status, a 24-hour load-time chart, uptime and recent problems. Admins and reviewers can both see it; only admins can change the settings, run a check or send a test email.
 
-**What it checks, and why that way.** Zen Cart is only reachable with a shop session, and Cloudflare shows its bot check ("Just a moment") to automated requests on every Zen Cart address. So the shop is checked two ways. **Direct** goes straight to the shop server on the office network, where there is no challenge, and tells you the shop server itself works. **Through Cloudflare** reaches the shop the way customers do, and tells you they can get to it. That second check relies on a Cloudflare rule letting the office's internet address through -- 220.233.203.122, set as the office address on the Site health page. The monitor never tries to get past the bot check any other way. Until the rule exists, or if the office address ever changes, that page shows "Blocked by Cloudflare", and the alert names the address Cloudflare saw next to the one the rule allows. By default the monitor checks the shop home page both ways, a category page and the landing page.
+**What it checks, and why that way.** The shop is checked two ways. **Direct** goes straight to the shop server on the office network, where nothing is in the way, and tells you the shop server itself works. **Through Cloudflare** reaches the shop the way customers do, and tells you they can get to it.
+
+The second one takes some care. Cloudflare's WAF rules challenge any address holding a Zen Cart session (`zenid=`) or a category path, which is most of the shop, and an automated request cannot answer a bot check. The monitor does not try to get past one. Instead it asks for a shop page those rules do not match, and sends its session **in a cookie**, which the rules do not read. Zen Cart accepts a session that way, so the check loads a genuine shop page as a customer would. It also matters for load: without a session the shop issues a new one on every request, which costs it about 5 seconds each; with the cookie it reuses one and answers in about half a second.
+
+If those rules change and that page is challenged, it shows "Blocked by Cloudflare" and says so in the alert -- not an outage, but worth knowing. The other way to let the monitor through is a Cloudflare rule allowing the office's internet address, which is recorded on the Site health page so the alert can tell you when that address has changed. By default the monitor checks the shop home page and a category page directly, one shop page through Cloudflare, and the landing page.
 
 Each check confirms the page answers, lands where it should, contains what it must (the shop's title, say), loads in reasonable time and has a valid certificate. A page that answers "success" but shows an error or the wrong page still counts as a problem.
 

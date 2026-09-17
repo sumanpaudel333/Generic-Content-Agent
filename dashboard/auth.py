@@ -43,7 +43,22 @@ SESSION_LIFETIME = timedelta(hours=12)
 
 ROLE_ADMIN = "admin"
 ROLE_REVIEWER = "reviewer"
-ROLES = (ROLE_ADMIN, ROLE_REVIEWER)
+ROLE_SALES = "sales"
+ROLES = (ROLE_ADMIN, ROLE_REVIEWER, ROLE_SALES)
+
+ROLE_LABELS = {
+    ROLE_ADMIN: "Admin",
+    ROLE_REVIEWER: "Reviewer",
+    ROLE_SALES: "Sales",
+}
+ROLE_DESCRIPTIONS = {
+    ROLE_ADMIN: "Everything, including people, settings, jobs and sending email.",
+    ROLE_REVIEWER: "Checks and approves product descriptions, works the lead list, and can see "
+                   "Chat Insights and Site health.",
+    ROLE_SALES: "Works the lead list -- checks for leads and sets their status -- and reads "
+                "Chat Insights and Site health. Cannot send email or change settings, and does "
+                "not see the Content Agent.",
+}
 
 # ---------------------------------------------------------------------------
 # What each role may do
@@ -68,22 +83,55 @@ ROLES = (ROLE_ADMIN, ROLE_REVIEWER)
 # that has not been alerted stays un-alerted, so the overnight job or an admin
 # still sends it.
 #
+# Sales works leads. They open Chat Insights -- the reports, the transcripts,
+# the lead list -- and Site health, check for leads and set each lead's status
+# as they follow it up. The Content Agent is not theirs: it is not in their
+# sidebar and its addresses refuse them. Nor is anything that sends email,
+# starts a job or changes a setting; those stay with admins (see
+# ADMIN_ONLY_PERMISSIONS below). Their "check for leads" finds leads but sends
+# no alert email, the same split a reviewer already has.
+#
+# Opening a section is a permission of its own (the view_* ones), checked for
+# every address under that section before any route runs -- see
+# SECTION_PERMISSIONS in dashboard/app.py. Until there was a role that could not
+# see everything, everybody signed in could open every page, so nothing had to.
+#
 # Kept as a table rather than scattered role checks so that adding a role, or
 # moving one capability, is one edit in one place -- and so a test can assert
 # the whole matrix rather than hunting for the routes that forgot.
 # ---------------------------------------------------------------------------
-PERM_REVIEW = "review"              # approve, turn down, edit, publish, lead status
+PERM_VIEW_CONTENT = "view_content"          # open the Content Agent at all
+PERM_VIEW_CHAT = "view_chat"                # Chat Insights: reports, transcripts, leads
+PERM_VIEW_SITE_HEALTH = "view_site_health"  # the Site health page
+PERM_REVIEW = "review"              # approve, turn down, edit, publish
+PERM_WORK_LEADS = "work_leads"      # set a lead's status as it is followed up
 PERM_FIND_LEADS = "find_leads"      # re-scan stored chats for contact details
 PERM_RUN_JOBS = "run_jobs"          # fetch a batch, run the analysis, sync leads
 PERM_SEND_MAIL = "send_mail"        # email a report, send the morning lead list
 PERM_VIEW_MAIL_LOG = "view_mail_log"  # the record of which emails went out
 PERM_ADMINISTER = "administer"      # users, logs, activity, photo storage
 
+_VIEW_EVERYTHING = frozenset({PERM_VIEW_CONTENT, PERM_VIEW_CHAT, PERM_VIEW_SITE_HEALTH})
+
 PERMISSIONS: dict[str, frozenset] = {
-    ROLE_ADMIN: frozenset({PERM_REVIEW, PERM_FIND_LEADS, PERM_RUN_JOBS,
-                            PERM_SEND_MAIL, PERM_VIEW_MAIL_LOG, PERM_ADMINISTER}),
-    ROLE_REVIEWER: frozenset({PERM_REVIEW, PERM_FIND_LEADS}),
+    ROLE_ADMIN: _VIEW_EVERYTHING | {PERM_REVIEW, PERM_WORK_LEADS, PERM_FIND_LEADS, PERM_RUN_JOBS,
+                                    PERM_SEND_MAIL, PERM_VIEW_MAIL_LOG, PERM_ADMINISTER},
+    ROLE_REVIEWER: _VIEW_EVERYTHING | {PERM_REVIEW, PERM_WORK_LEADS, PERM_FIND_LEADS},
+    ROLE_SALES: frozenset({PERM_VIEW_CHAT, PERM_VIEW_SITE_HEALTH,
+                           PERM_WORK_LEADS, PERM_FIND_LEADS}),
 }
+
+# Sending email, starting jobs, reading the mail log and changing settings or
+# people belong to admins and nobody else. Checked as this module loads: an
+# edit to the table above that hands one of them to another role stops the
+# dashboard starting, rather than quietly giving the permission away.
+ADMIN_ONLY_PERMISSIONS = frozenset({PERM_RUN_JOBS, PERM_SEND_MAIL, PERM_VIEW_MAIL_LOG,
+                                    PERM_ADMINISTER})
+for _role, _granted in PERMISSIONS.items():
+    if _role != ROLE_ADMIN and _granted & ADMIN_ONLY_PERMISSIONS:
+        raise RuntimeError(
+            f"Role {_role!r} has {sorted(_granted & ADMIN_ONLY_PERMISSIONS)}, but sending email, "
+            "running jobs and changing settings are admin-only. Fix PERMISSIONS in dashboard/auth.py.")
 
 
 def can(user: dict | None, permission: str) -> bool:
@@ -96,6 +144,11 @@ def can(user: dict | None, permission: str) -> bool:
     if not user:
         return False
     return permission in PERMISSIONS.get(user.get("role") or "", frozenset())
+
+
+def role_label(role: str | None) -> str:
+    """The name a person sees for a role: "Sales", not "sales"."""
+    return ROLE_LABELS.get(role or "", role or "")
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS users (
@@ -159,6 +212,8 @@ def init_db():
             existing = {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
             if column not in existing:
                 conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {col_type}")
+        # The sales role was briefly called "insights". Harmless when no account has it.
+        conn.execute("UPDATE users SET role = ? WHERE role = 'insights'", (ROLE_SALES,))
 
 
 def _now() -> datetime:

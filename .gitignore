@@ -16,6 +16,8 @@ __pycache__/
 
 # Local runtime data
 logs/*.db
+logs/*.db.bak-*
+logs/*.lock
 logs/*.log
 logs/*.jsonl
 data/
