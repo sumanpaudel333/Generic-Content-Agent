@@ -239,9 +239,20 @@ CHAT_OWN_CONTACTS = list(_chat_cfg.get("own_contacts", []) or [])
 # the customer's own words before it is used, so it can add detail but cannot
 # invent a contact.
 _extract_cfg = _chat_cfg.get("lead_extraction", {}) or {}
-CHAT_LEAD_EXTRACT_ENABLED = bool(_extract_cfg.get("enabled", False))
+# Default true, matching config.example.yaml. It used to default false here, so
+# a fresh install behaved differently from the example that documents it.
+CHAT_LEAD_EXTRACT_ENABLED = bool(_extract_cfg.get("enabled", True))
 CHAT_LEAD_EXTRACT_MODEL = str(_extract_cfg.get("model", "claude") or "claude")
 CHAT_LEAD_EXTRACT_LOCAL_MODEL = str(_extract_cfg.get("local_model", "") or "")
+
+# ---------------------------------------------------------------------------
+# Staff assistant -- see assistant/chat.py
+# ---------------------------------------------------------------------------
+_assistant_cfg = dict(_cfg.get("assistant", {}) or {})
+ASSISTANT_MODEL = str(_assistant_cfg.get("model", "bcsands-content-agent:latest"))
+ASSISTANT_TIMEOUT_SECONDS = max(10, int(_assistant_cfg.get("timeout_seconds", 180)))
+ASSISTANT_DESCRIBED_PRODUCTS = max(1, int(_assistant_cfg.get("described_products", 4)))
+ASSISTANT_NAMED_PRODUCTS = max(0, int(_assistant_cfg.get("named_products", 12)))
 
 CHAT_LEADS_LOOKBACK_DAYS = max(1, int(_chat_cfg.get("leads_lookback_days", 3)))
 

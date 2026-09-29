@@ -210,12 +210,19 @@ chat_insights:
     model: local            # local | claude
     local_model: llama3.2:3b   # blank = chat_insights.model
 
-  # --- Daily lead digest -------------------------------------------------
-  # Runs every morning, independent of the weekly report. Detection is
-  # deterministic (no model), so this job does not need Ollama running.
-  leads_lookback_days: 3          # re-read a few days so a conversation that
-                                   # spans midnight is not missed
-  leads_email_when_empty: false   # false = a day with no leads sends no email
+  # --- Lead emails -------------------------------------------------------
+  # The BCSands-Leads job runs at these times every day, Australian Eastern.
+  # Each run fetches the latest chats, finds the leads and emails one call list
+  # covering the chats since the run before -- so the 04:00 run carries the
+  # evening and night. Change these AND the triggers on the scheduled task
+  # (-LeadsAt in scripts/register_scheduled_tasks.ps1) together: the dashboard
+  # uses this list to tell whether a run was missed.
+  leads_schedule: ["04:00", "09:00", "11:00", "13:00", "16:00"]
+  leads_email_when_empty: false   # false = a window with no leads sends no email
+  # Most time the model may spend tidying new leads in one run. Anything past
+  # it is emailed with the rules' details and tidied by the next run.
+  lead_model_budget_seconds: 180
+  leads_lookback_days: 3          # only used by the older day-based helpers
   # Our OWN phone numbers and email addresses. The bot quotes the branch
   # numbers in nearly every conversation, so without listing them here they
   # get harvested as if a customer had given them. Derived config covers
@@ -228,6 +235,18 @@ chat_insights:
   # recorded as a lead at all, since there would be nobody to follow up.
   alert_lead_types: ["form_submission", "contact_shared"]
   alert_on_job_failure: true
+
+# ---------------------------------------------------------------------------
+# Staff assistant (admin only): ask a question, get an answer built from the
+# approved descriptions and the product list read from your platform. Local
+# model only -- nothing leaves the server. See assistant/chat.py for the four
+# things it is never allowed to state.
+# ---------------------------------------------------------------------------
+assistant:
+  model: "bcsands-content-agent:latest"   # an Ollama model tag on this server
+  timeout_seconds: 180                    # a small model on a CPU takes its time
+  described_products: 4                   # approved descriptions given per question
+  named_products: 12                      # extra product names and codes per question
 
 # ---------------------------------------------------------------------------
 # Site monitor: checks the online shop every five minutes and emails when a

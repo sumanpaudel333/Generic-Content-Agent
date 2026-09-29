@@ -531,16 +531,12 @@ def set_lead_status(conversation_id: str, status: str, *, owner: str = "",
                 (status, owner, note, _now(), conversation_id))
 
 
-def set_lead_crm_status(conversation_id: str, crm_status: str, *, ref: str = "") -> None:
-    """Whether this lead is known to have reached the CRM. 'manual' records a
-    human confirming it by eye, which is the only signal available while the
-    hand-off runs through a Chatbase action into Zapier."""
-    init_db()
-    with _connect() as conn:
-        conn.execute(
-            """UPDATE leads SET crm_status = ?, crm_ref = ?, crm_checked_at = ?
-               WHERE conversation_id = ?""",
-            (crm_status, ref, _now(), conversation_id))
+# There was a set_lead_crm_status() here, for recording that a lead had been
+# found in the CRM. Nothing ever called it, so every form submission carried a
+# "check CRM" badge nobody could clear. The columns (crm_status, crm_ref,
+# crm_checked_at) are kept -- they cost nothing and the reconciliation may yet
+# be built -- but the unused writer is gone rather than sitting there implying
+# the feature exists.
 
 
 def purge_contactless_leads() -> int:

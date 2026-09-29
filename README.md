@@ -775,10 +775,23 @@ Two types remain, and they fail differently:
 | `form_submission` | Customer filled the contact form | Yes -- so one of these missing from the CRM means the action did not fire. Never seen on this deployment |
 | `contact_shared` | Customer typed a phone or email into the chat | **No** -- Chatbase has nothing to send, so these were previously invisible |
 
+Form submissions used to carry a **check CRM** badge. Nothing in the system ever recorded a CRM check, so it appeared on every one of them for life and nobody could clear it -- a warning that cannot be acted on only teaches people to ignore warnings. It is gone. The `crm_status`, `crm_ref` and `crm_checked_at` columns stay, ready for a real reconciliation.
+
 Leads are also filtered by the analysis category (`product_enquiry`,
 `stock_availability`, `delivery`, ...) and carry a status you set as you work
 them (`new` -> `contacted` -> `won`/`lost`/`ignored`). A re-sync refreshes
 detection but never overwrites a status, owner or note a human set.
+
+**Open** on a lead row gives the whole picture on one page: the contact details, what
+they asked for, the hand-off reasoning in full (previously a tooltip), where the contact
+details came from and whether the model tidied them, who last changed the status and
+when, whether an alert was emailed, and which lead email carried it. Sales, reviewers and
+admins can all use it.
+
+That page is also where a **note** is written -- what happened on the call, when to ring
+back, anything the next person needs. The field has been in the database all along with
+nothing to write it. The list's quick status dropdown leaves any note alone, and every
+note is recorded in the activity trail.
 
 Configure in `config.yaml` under `chat_insights`:
 
@@ -811,6 +824,14 @@ send, just without links.
 > discarded when conversations were saved. It is now stored. Conversations
 > fetched before that change have no form details on record; re-running a past
 > week backfills them from the API.
+
+## Finding a product in the queue
+
+Every Content Agent tab has a **Find** box: type a SKU, part of a product name, or a queue row number. It works with the filters beside it and is done in the database, so the counts and the page links stay honest -- searching 354 pending rows returns a page of matches, not a filtered view of page one.
+
+`%` and `_` mean something to SQL, so they are escaped and matched literally; a search for `SAND_50` finds that SKU rather than everything. A search with no matches names what was searched for, because a blank list after a typo looks exactly like an empty queue.
+
+This also repairs the activity log: its links have always pointed at `?q=<row id>`, and until now nothing read that.
 
 ## Confirming an action
 
@@ -964,6 +985,24 @@ accepted that were **not** on the product when read back -- where a reviewer
 believes the job is done and it is not. Those keep their local copies; re-publish
 the queue row, or check the product in Odoo.
 
+## Sending approved descriptions to Odoo in bulk
+
+**Content Agent -> Done** has a send bar for admins: **Send selected** (tick the approved descriptions you want), **Send the N never sent**, or **Send all N (re-sends)**. This is the staging-to-live move: everything approved was written against staging, and the same copy has to go to the live shop.
+
+The bar names the Odoo it will write to -- environment, database and host -- and so does every confirmation, because the only thing that decides where it goes is a line in `.env` that the page cannot otherwise show you.
+
+**Re-sending is safe and is the point.** A publish is an Odoo `write` of the description field on the product with that SKU, so the approved version replaces whatever is there. Images already uploaded are skipped, so nothing is duplicated; only new photos go up.
+
+| What happens | Detail |
+|---|---|
+| One product at a time | With a short pause between, so a few hundred writes are not a flood |
+| Stops early | After 5 failures in a row, on the assumption that the environment, the credentials or the SKUs are wrong. Nothing after that point is attempted |
+| Skips quietly | A row no longer approved, or with nothing written, is skipped rather than invented |
+| Failures are kept | They appear under **Did not send**, and can be retried one at a time or in the next bulk send |
+| Recorded | One activity-log line per product, naming the Odoo, plus one for the run |
+
+**Switching from staging to live:** change the Odoo settings in `.env`, then **restart the dashboard**. The connection is read once when the process starts, so until it restarts the button still writes to staging -- the Overview shows a "settings changed, restart me" banner when they differ. After the restart, use **Send all** to push every approved description to live. The `published` flag on each row records that it was sent, not which Odoo it was sent to, which is why the re-send option exists.
+
 ## Exporting approved descriptions
 
 Admins can download approved descriptions from **Content Agent -> Done**. The file has one product per row with three columns: **SKU**, **Product name** and **Description**. Reviewers do not see the download, and the address refuses them if they type it in.
@@ -1007,6 +1046,49 @@ From 21:00 to 06:00 alerts are held, not sent. Pages are still checked and recor
 Before calling an outside page down, the monitor checks that this server can reach the internet at all. If it cannot, the check is recorded as "could not check" and never counts toward an alert, so a broken office connection is not reported as the site going down. That is also its limit: a monitor inside the office cannot warn you when the office internet or mail server is down.
 
 Everything above -- who gets alerts, quiet hours, thresholds, which pages -- is changed on the Site health page; `config.yaml` only holds the starting values. The checks run from the scheduled task `BCSands-SiteMonitor` every five minutes, and its log is under Job history.
+
+## Downloading a report as a PDF
+
+Every weekly chat report has a **Download PDF** button beside the email status. It is the same document that was emailed -- the stored report HTML, printed by the browser already installed on this server (Chrome, or Edge), so there is no second layout to keep in step and no PDF library to install. A week's report takes about four seconds and comes out around 130 KB.
+
+The render is sealed off: the report is written to a temporary file, opened from disk, and DNS is pointed at nothing, so a document holding customer names and phone numbers cannot fetch or leak anything while it prints. The temporary files go afterwards.
+
+Anyone who can open Chat Insights can take one, since it is the document they can already read on screen -- but **every download is recorded** in the activity log with the week it covered, because it leaves the building as a file with customer details in it.
+
+If neither browser is installed, the page says the download is unavailable instead of offering a button that fails. Point `PDF_BROWSER` in `.env` at a browser to override where it looks.
+
+## Staff assistant
+
+**Assistant** in the sidebar (admins only) answers questions about the products, using the local model on this server. Nothing leaves the building.
+
+**It is grounded, deliberately.** Asked from memory, the fine-tuned model called paving sand "a recycled aggregate made from crushed concrete" and invented "10mm and 13mm sand". So no answer is built from what the model remembers. Each question is matched against two sources, which are handed to the model as the only thing it may answer from:
+
+| Source | What it gives |
+|---|---|
+| Approved descriptions | Full, human-checked copy for the products we have written up |
+| The Odoo product list | Every active product's name and SKU -- about 5,300, held as a local snapshot |
+
+Each answer shows which products it was built from, with a link to the approved description, so it can be checked in one click. When nothing matches, the answer is marked as not based on the catalogue.
+
+**Four things it must never say:** a price, stock, a delivery cost, or a standards claim. These are in the prompt *and* checked in the answer afterwards, because a prompt is an instruction, not a guarantee. A slip is shown above the answer as a warning rather than quietly passed on. That check earns its place: in the first real trial the model wrote "a top dressing for Australian Standard AS4419 soils", which is invented.
+
+**It reads as a conversation.** Questions on the right, answers on the left, the box pinned at the bottom; Enter sends, Shift+Enter starts a new line. The question appears straight away and the answer arrives in place with a "thinking… 12s" counter, because ten to twenty-five seconds of a blank page reads as broken. Follow-up questions keep the thread. The page posts to a small JSON endpoint to do that, and the plain form still works if the JavaScript never runs.
+
+**Every answer is stored** with its sources and can be marked Useful or Wrong. That is how we find out whether this is worth keeping, rather than going on impressions.
+
+**Models.** The picker offers the fine-tuned BC Sands model and the general one. Measured on the same three questions: the fine-tuned model is faster (about 11 s) but weaker -- it invented the standard above and answered one question with a fragment. The general model took 9-24 s and was accurate, naming real products with their SKUs and correctly refusing a price question with "I don't have that information ... check with the yard". Set the default with `assistant.model` in `config.yaml`.
+
+**The product snapshot** is refreshed from the Assistant page ("Refresh product list", about 10 seconds). It reads whichever Odoo the dashboard is pointed at, so refresh it after switching between staging and live. Products with no Internal Reference (SKU) are skipped, as everywhere else here.
+
+## Did the job run?
+
+**Job history** opens with a **Scheduled jobs** panel: every `BCSands-*` task with its schedule in words, what happened last time in English rather than a result code, when it last ran and when it runs next, and a link to that job's own log. Until now this question could only be answered over a remote desktop with `scripts/job_status.ps1`, which is the first troubleshooting step in this README.
+
+It is read-only. Starting or changing a task is still done on the server: this dashboard runs as SYSTEM, and a web form that starts SYSTEM processes is a much bigger thing than a status page.
+
+Windows is asked through `schtasks` (about two seconds for all the tasks on this server), and the answer is cached for a minute so opening the page is free.
+
+**A task that is not listed is reported as "not visible to this dashboard", not as missing.** Task objects carry their own permissions: one registered by another account can be invisible while running perfectly well. On this server three of the seven are invisible to an ordinary admin account and all three are demonstrably running. The log underneath, written by the job itself, is the second opinion.
 
 ## Audit trail
 
@@ -1077,6 +1159,21 @@ usually the faster route to something publishable.
 Image upload is an optional capability rather than part of that contract, so a connector written before it existed keeps working. To support it, override `supports_images` (return `True`), `write_product_images`, and `get_product_image_state`. Leave them alone and the dashboard reports honestly that your platform cannot take images, instead of failing at publish time.
 
 One Odoo-specific note: external API (XML-RPC/JSON-RPC) access on Odoo Online is only available on Custom pricing plans, not the Free or Standard tiers. Self-hosted and Odoo.sh instances aren't affected by this. Run `tests/test_odoo_connection.py` to check whether your instance supports it before relying on live pulls.
+
+## Checks
+
+`tests/checks/` holds end-to-end checks that drive the real app: they sign in, open pages,
+post forms and assert what comes back. Each one uses throwaway databases, deletes any
+account it creates, and never sends email, reaches Chatbase or writes to Odoo.
+
+```bash
+python -m tests.checks.run_all           # every suite, one line each
+python -m tests.checks.run_all leads     # only suites whose name matches
+python tests/checks/check_roles.py       # one suite, with its detail
+```
+
+They live in the repo for a reason: the first set was written in a temporary folder and
+the system deleted it a week later, taking the coverage with it.
 
 ## Honest limitations
 
