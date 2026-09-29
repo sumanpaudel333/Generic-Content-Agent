@@ -91,6 +91,13 @@ AUDIT_ACTIONS = (
     "approved", "rejected", "edited", "published", "publish_failed",
     "reopened", "regenerated", "user_created", "user_disabled", "user_enabled",
     "password_reset", "images_added", "images_removed", "images_reclaimed",
+    "descriptions_exported", "bulk_published", "assistant_catalogue", "report_downloaded",
+    # Written all along but missing from this list, so the activity log's filter
+    # could not reach them -- permission_denied alone was 192 of 446 rows, and
+    # it is the security-relevant one.
+    "permission_denied", "invite_sent", "reset_link_sent", "user_updated", "user_deleted",
+    "own_password_changed", "site_monitor_check", "site_monitor_settings",
+    "site_monitor_test_email", "lead_digest_run", "lead_test_run", "lead_note",
 )
 
 
@@ -211,6 +218,24 @@ def get_row(row_id: int) -> dict | None:
         return _row_to_dict(row) if row else None
 
 
+def _search_clause(needle: str) -> tuple[str, list]:
+    """Matches a SKU, part of a title, or a queue row id.
+
+    LIKE with an explicit ESCAPE: a customer-facing catalogue is full of "_"
+    and the occasional "%", and without escaping them a search for "1_5m"
+    quietly matches far more than it should. The row id is included because
+    the activity log links here with one.
+    """
+    escaped = needle.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    like = f"%{escaped}%"
+    clause = "(product_id LIKE ? ESCAPE '\\' OR title LIKE ? ESCAPE '\\'"
+    params: list = [like, like]
+    if needle.isdigit():
+        clause += " OR id = ?"
+        params.append(int(needle))
+    return clause + ")", params
+
+
 def _build_filter_clause(
     status: str | None,
     task_type: str | None,
@@ -218,9 +243,15 @@ def _build_filter_clause(
     confidence: str | None,
     has_safety_flags: bool | None,
     published: bool | None,
+    q: str = "",
 ) -> tuple[str, list]:
     clauses = []
     params: list = []
+    needle = (q or "").strip()
+    if needle:
+        clause, search_params = _search_clause(needle)
+        clauses.append(clause)
+        params += search_params
     if status:
         clauses.append("status = ?")
         params.append(status)
@@ -254,9 +285,11 @@ def list_rows(
     published: bool | None = None,
     limit: int | None = None,
     offset: int = 0,
+    q: str = "",
 ) -> list[dict]:
     init_db()
-    where, params = _build_filter_clause(status, task_type, source, confidence, has_safety_flags, published)
+    where, params = _build_filter_clause(status, task_type, source, confidence, has_safety_flags,
+                                          published, q)
     query = f"SELECT * FROM review_queue{where} ORDER BY created_at DESC"
     if limit is not None:
         query += " LIMIT ? OFFSET ?"
@@ -273,9 +306,11 @@ def count_rows(
     confidence: str | None = None,
     has_safety_flags: bool | None = None,
     published: bool | None = None,
+    q: str = "",
 ) -> int:
     init_db()
-    where, params = _build_filter_clause(status, task_type, source, confidence, has_safety_flags, published)
+    where, params = _build_filter_clause(status, task_type, source, confidence, has_safety_flags,
+                                          published, q)
     with _connect() as conn:
         row = conn.execute(f"SELECT COUNT(*) as n FROM review_queue{where}", params).fetchone()
         return row["n"] if row else 0

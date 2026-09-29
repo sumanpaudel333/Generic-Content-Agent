@@ -25,6 +25,7 @@ import json
 import logging
 import os
 import sys
+import time
 from datetime import datetime, timedelta, timezone
 from typing import Any
 from urllib.parse import urlencode
@@ -40,6 +41,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Resp
 from content_seo_agent import (review_queue, small_model_client, assembler, pipeline,
                                  content_status as cs, product_images)
 from content_seo_agent.assembler import assemble_html
+from content_seo_agent import export as description_export
 from content_seo_agent.batch_runner import process_dataframe
 from content_seo_agent.demand_link import demand_terms
 from content_seo_agent.constants import Status, TaskType, Source
@@ -49,11 +51,14 @@ from connectors.odoo_connector import _derive_db_name, summarise_error
 from chat_insights import (alerts as chat_alerts, daily_leads as chat_daily,
                             db as chat_db, leads as chat_leads, mailer,
                             weekly_run as chat_run)
-from dashboard import job_logs
+from dashboard import job_logs, pdf as report_pdf, task_status
 from config import settings
 from fastapi.staticfiles import StaticFiles
 from dashboard import auth, ui, user_mail
 from site_monitor import emails as monitor_emails, run as monitor_run, store as monitor_store
+from assistant import (catalogue as assistant_catalogue, chat as assistant_chat,
+                       store as assistant_store)
+from config.localtime import au_datetime, au_day, au_time, to_au
 
 logger = logging.getLogger("dashboard")
 app = FastAPI(title="Content and Automation Dashboard")
@@ -86,9 +91,9 @@ _regen_state: dict[str, Any] = {"running": False, "started_at": None, "last_resu
 
 # And for the weekly chat analysis, which is the slowest job of the three --
 # one model call per conversation on a CPU-only host.
-# The morning lead job, when a person starts it from the dashboard. Separate
-# from _chat_state: this run takes seconds and needs no model, so there is no
-# reason one should block the other.
+# The lead email job, when a person starts it from the dashboard. Separate
+# from _chat_state: this run takes seconds and uses the model only on new
+# leads, so there is no reason one should block the other.
 _leads_state: dict[str, Any] = {"running": False, "started_at": None, "last_result": None}
 
 # After this long, a run that still says it is going is assumed to have died --
@@ -107,6 +112,32 @@ def _lead_run_in_progress() -> bool:
                         started)
         return False
     return True
+
+
+# "Check for leads": fetches the latest chats from Chatbase and finds the leads,
+# in the background, so the page never waits on Chatbase or the model.
+_lead_check_state: dict[str, Any] = {"running": False, "started_at": None, "last_result": None}
+
+
+def _lead_check_in_progress() -> bool:
+    started = _lead_check_state.get("started_at")
+    return bool(_lead_check_state["running"] and started
+                and datetime.now(timezone.utc) - started <= LEAD_RUN_STALE_AFTER)
+
+# Sending approved descriptions to Odoo in bulk -- the staging-to-live push.
+# Its own state, like the other long jobs, so the page can show progress and a
+# second press cannot start a parallel run.
+_publish_state: dict[str, Any] = {"running": False, "started_at": None, "last_result": None,
+                                  "total": 0, "done": 0, "target": ""}
+
+# A run that fails this many times in a row is stopped. The whole point of this
+# button is pushing a whole catalogue at a live Odoo: if the first few writes
+# fail, the environment, the credentials or the SKUs are wrong, and grinding
+# through hundreds more failures helps nobody.
+PUBLISH_ABORT_AFTER = 5
+# Between products. One write (plus any new images) per product is light, but
+# a few hundred in a row should not look like a flood to Odoo.
+PUBLISH_PAUSE_SECONDS = 0.3
 
 _chat_state: dict[str, Any] = {"running": False, "started_at": None, "last_result": None,
                                 "total": 0, "done": 0}
@@ -167,6 +198,61 @@ def _model_suffix(model: str) -> str:
     return f" with {label}"
 
 
+def _run_publish_job(row_ids: list[int], actor: str, target: str):
+    """Sends each approved row's description to Odoo, one product at a time.
+
+    Re-sending is safe and is the point: the description field is overwritten
+    with the current version, and images already uploaded are skipped, so a row
+    that went to staging can be pushed to live without duplicating anything.
+    """
+    sent = failed = skipped = 0
+    streak, aborted = 0, ""
+    try:
+        for index, row_id in enumerate(row_ids):
+            if index and PUBLISH_PAUSE_SECONDS:
+                time.sleep(PUBLISH_PAUSE_SECONDS)
+            row = review_queue.get_row(row_id)
+            if not row or row["status"] != Status.APPROVED or not row.get("parsed_output"):
+                # Not approved any more, or nothing written: never invent a write.
+                skipped += 1
+                _publish_state["done"] += 1
+                continue
+            try:
+                result = _attempt_publish(row_id)
+                ok = bool((result or {}).get("published"))
+            except Exception as e:
+                logger.exception("Bulk publish failed for row %s", row_id)
+                result, ok = {"odoo_write_detail": str(e)}, False
+            detail = (result or {}).get("odoo_write_detail", "")
+            review_queue.record_audit(actor, "published" if ok else "publish_failed",
+                                      row_id=row_id, product_id=row.get("product_id", ""),
+                                      title=row.get("title", ""),
+                                      detail=f"Bulk send to Odoo ({target}). {detail}"[:1000])
+            if ok:
+                sent += 1
+                streak = 0
+            else:
+                failed += 1
+                streak += 1
+            _publish_state["done"] += 1
+            if streak >= PUBLISH_ABORT_AFTER:
+                aborted = (f"Stopped after {streak} failures in a row -- nothing else was sent. "
+                           f"Check which Odoo this is pointed at and that the SKUs exist there. "
+                           f"Last error: {_readable_failure(detail)}")
+                logger.error("Bulk publish aborted: %s", aborted)
+                break
+        _publish_state["last_result"] = {"sent": sent, "failed": failed, "skipped": skipped,
+                                         "total": len(row_ids), "target": target,
+                                         "aborted": aborted, "error": None}
+    except Exception as e:
+        logger.exception("Bulk publish job failed")
+        _publish_state["last_result"] = {"sent": sent, "failed": failed, "skipped": skipped,
+                                         "total": len(row_ids), "target": target,
+                                         "aborted": "", "error": str(e)}
+    finally:
+        _publish_state["running"] = False
+
+
 def _run_regen_job(row_ids: list[int], model: str = ""):
     regenerated = empty = failed = 0
     try:
@@ -217,6 +303,49 @@ def _run_chat_job(send_email: bool):
 # Auth
 # ---------------------------------------------------------------------------
 
+# Which permission each section needs just to be opened. Checked in
+# require_auth for every address under it, pages, forms and downloads alike, so
+# a section a role cannot see stays shut even for a route that never checks for
+# itself -- and most Content Agent routes do not, because every role could use
+# them until the sales role arrived. The old short addresses redirect into
+# the Content Agent, and /api/status is its queue counts, so they count as it.
+SECTION_PERMISSIONS: tuple[tuple[str, str], ...] = (
+    (CONTENT_AGENT, auth.PERM_VIEW_CONTENT),
+    ("/needs-retry", auth.PERM_VIEW_CONTENT),
+    ("/approved", auth.PERM_VIEW_CONTENT),
+    ("/history", auth.PERM_VIEW_CONTENT),
+    ("/api/status", auth.PERM_VIEW_CONTENT),
+    (CHAT_INSIGHTS, auth.PERM_VIEW_CHAT),
+    ("/site-health", auth.PERM_VIEW_SITE_HEALTH),
+    # People, job history, the activity log and photo storage. Every one of
+    # those routes checks for itself as well; this is the second lock.
+    ("/settings", auth.PERM_ADMINISTER),
+    ("/assistant", auth.PERM_ADMINISTER),
+    # What the assistant page's own JavaScript posts to. Under /api/ so a
+    # signed-out or unauthorised request gets JSON back rather than a redirect
+    # the page cannot follow.
+    ("/api/assistant", auth.PERM_ADMINISTER),
+)
+
+
+def section_permission(path: str) -> str | None:
+    for prefix, permission in SECTION_PERMISSIONS:
+        if path == prefix or path.startswith(prefix + "/"):
+            return permission
+    return None
+
+
+def _section_denied(request: Request, user: dict, path: str):
+    permission = section_permission(path)
+    if permission is None or auth.can(user, permission):
+        return None
+    _audit(request, "permission_denied", None,
+           detail=f"Tried to open {path} without access to that part of the dashboard.")
+    if path.startswith("/api/"):
+        return JSONResponse({"error": "not permitted"}, status_code=403)
+    return _redirect("/", err="Your account does not have access to that page.")
+
+
 @app.middleware("http")
 async def require_auth(request: Request, call_next):
     """Gate every route behind a valid session. HTML requests get bounced to
@@ -236,6 +365,9 @@ async def require_auth(request: Request, call_next):
         return RedirectResponse(url=f"/login?{urlencode({'next': nxt})}", status_code=303)
 
     request.state.user = user
+    denied = _section_denied(request, user, path)
+    if denied is not None:
+        return denied
     return await call_next(request)
 
 
@@ -577,7 +709,12 @@ def overview(request: Request):
     odoo_ok = odoo_connector.is_configured()
     source_label = "live product list" if settings.USE_ODOO_AS_PRODUCT_SOURCE else "exported list"
 
-    tiles = "".join([
+    # The tiles are all Content Agent numbers, so somebody who cannot open the
+    # Content Agent gets the module cards they can use and nothing else.
+    can_content = _can(request, auth.PERM_VIEW_CONTENT)
+    products_note = (f" Products are read from the <b>{html.escape(source_label)}</b>."
+                     if can_content else "")
+    tiles = "" if not can_content else "".join([
         ui.stat_tile("Waiting for you", pending, variant="accent", href=CONTENT_AGENT),
         ui.stat_tile("Live on the website", published, variant="ok"),
         ui.stat_tile("Did not send", unpublished, variant="warn" if unpublished else "",
@@ -595,6 +732,8 @@ def overview(request: Request):
 
     cards = ""
     for m in ui.MODULES:
+        if m.get("permission") and not _can(request, m["permission"]):
+            continue
         live = m["status"] == "live"
         stats = ""
         if m["key"] == "content-agent":
@@ -637,12 +776,11 @@ def overview(request: Request):
     <div class="page-head">
       <div>
         <h1>Welcome back</h1>
-        <p class="subtitle">Everything that needs your attention, in one place.
-           Products are read from the <b>{html.escape(source_label)}</b>.</p>
+        <p class="subtitle">Everything that needs your attention, in one place.{products_note}</p>
       </div>
     </div>
     {_restart_notice(request)}
-    <div class="stats">{tiles}</div>
+    {f'<div class="stats">{tiles}</div>' if tiles else ''}
     <h2>Automations</h2>
     <div class="modgrid">{cards}</div>
     """
@@ -1083,8 +1221,21 @@ def _parse_filters(request: Request) -> dict:
         "source": q.get("source") or None,
         "confidence": q.get("confidence") or None,
         "flagged_only": q.get("flagged_only") or None,
+        # A SKU, part of a product name, or a queue row id -- the activity log
+        # links here with one of those.
+        "q": (q.get("q") or "").strip()[:80] or None,
         "page": page,
     }
+
+
+def _no_matches_html(filters: dict, what: str) -> str:
+    """Nothing matched -- say what was searched for, because a blank list after
+    a typo looks the same as an empty queue."""
+    if filters.get("q"):
+        return ui.empty_state(f'Nothing matching “{filters["q"]}”',
+                              f"No descriptions {what} have that SKU or product name. Clear the "
+                              "search to see the rest, or try part of the name.")
+    return ui.empty_state("No matches", f"No descriptions {what} match these filters.")
 
 
 def _filter_bar_html(active: dict, base_path: str) -> str:
@@ -1095,10 +1246,15 @@ def _filter_bar_html(active: dict, base_path: str) -> str:
     source = active.get("source") or ""
     confidence = active.get("confidence") or ""
     flagged_only = active.get("flagged_only") or ""
-    is_filtered = any([task_type, source, confidence, flagged_only])
+    search = active.get("q") or ""
+    is_filtered = any([task_type, source, confidence, flagged_only, search])
 
     return f"""
     <form class="filter-bar" method="get" action="{base_path}">
+        <label>Find
+            <input type="search" name="q" value="{html.escape(search, quote=True)}"
+                   placeholder="SKU or product name" style="width:190px">
+        </label>
         <label>Type
             <select name="task_type">
                 {option("", "All", task_type)}
@@ -1419,7 +1575,8 @@ def _agent_page(request: Request, active: str, body_inner: str, title: str) -> s
     return ui.page_shell(body, title="Content Agent · Content and Automation",
                           active_module="content-agent", user=_current_user(request),
                           request=request, crumbs=crumbs,
-                          fetch_running=_fetch_state["running"] or _regen_state["running"])
+                          fetch_running=(_fetch_state["running"] or _regen_state["running"]
+                                         or _publish_state["running"]))
 
 
 # ---------------------------------------------------------------------------
@@ -1434,7 +1591,8 @@ def agent_queue(request: Request):
     flagged_only = True if filters["flagged_only"] else None
 
     common = dict(status=Status.PENDING, task_type=filters["task_type"], source=filters["source"],
-                   confidence=filters["confidence"], has_safety_flags=flagged_only)
+                   confidence=filters["confidence"], has_safety_flags=flagged_only,
+                   q=filters["q"] or "")
     rows = review_queue.list_rows(**common, limit=page_size, offset=offset)
     total = review_queue.count_rows(**common)
 
@@ -1442,13 +1600,13 @@ def agent_queue(request: Request):
         images_by_row = review_queue.list_images_for_rows([r["id"] for r in rows])
         cards_html = "".join(
             _card_html(row, images=images_by_row.get(row["id"], [])) for row in rows)
-    elif total == 0 and not any([filters["task_type"], filters["source"],
-                                  filters["confidence"], filters["flagged_only"]]):
+    elif total == 0 and not any([filters["task_type"], filters["source"], filters["confidence"],
+                                  filters["flagged_only"], filters["q"]]):
         cards_html = ui.empty_state("You are all caught up",
                                      "Nothing is waiting to be checked. Use “Fetch new products” "
                                      "to write descriptions for more of the range.")
     else:
-        cards_html = ui.empty_state("No matches", "No pending items match these filters.")
+        cards_html = _no_matches_html(filters, "waiting to be checked")
 
     bulk_bar = f"""
     <form id="bulk-form" method="post" action="{CONTENT_AGENT}/bulk/approve" style="display:contents"></form>
@@ -1492,16 +1650,20 @@ def agent_needs_retry(request: Request):
 
     common = dict(status=Status.APPROVED, published=False, task_type=filters["task_type"],
                    source=filters["source"], confidence=filters["confidence"],
-                   has_safety_flags=flagged_only)
+                   has_safety_flags=flagged_only, q=filters["q"] or "")
     rows = review_queue.list_rows(**common, limit=page_size, offset=offset)
     total = review_queue.count_rows(**common)
 
     retry_images = review_queue.list_images_for_rows([r["id"] for r in rows])
-    cards_html = ("".join(_card_html(r, show_publish_retry=True,
-                                      images=retry_images.get(r["id"], [])) for r in rows) if rows
-                   else ui.empty_state("Nothing to fix",
-                                        "Descriptions you approved that did not reach the product "
-                                        "page would show up here."))
+    if rows:
+        cards_html = "".join(_card_html(r, show_publish_retry=True,
+                                        images=retry_images.get(r["id"], [])) for r in rows)
+    elif filters["q"]:
+        cards_html = _no_matches_html(filters, "waiting to be sent again")
+    else:
+        cards_html = ui.empty_state("Nothing to fix",
+                                     "Descriptions you approved that did not reach the product "
+                                     "page would show up here.")
 
     query_state = {k: v for k, v in filters.items() if k != "page"}
     inner = (f'{_filter_bar_html(filters, f"{CONTENT_AGENT}/needs-retry")}{cards_html}'
@@ -1519,7 +1681,8 @@ def agent_rejected(request: Request):
     flagged_only = True if filters["flagged_only"] else None
 
     common = dict(status=Status.REJECTED, task_type=filters["task_type"], source=filters["source"],
-                   confidence=filters["confidence"], has_safety_flags=flagged_only)
+                   confidence=filters["confidence"], has_safety_flags=flagged_only,
+                   q=filters["q"] or "")
     rows = review_queue.list_rows(**common, limit=page_size, offset=offset)
     total = review_queue.count_rows(**common)
 
@@ -1546,7 +1709,7 @@ def agent_rejected(request: Request):
                     <div class="meta">SKU {html.escape(str(row['product_id']))}</div>
                 </div>
                 {note_html}
-                <div class="meta">Rejected: {html.escape(str(row.get('reviewed_at') or '--'))}
+                <div class="meta">Rejected: {html.escape(au_datetime(row.get('reviewed_at')))}
                     {f"by <b>{html.escape(row['reviewed_by'])}</b>" if row.get('reviewed_by') else ''}</div>
                 {_draft_preview_html(row.get('parsed_output') or {})}
                 <div class="actions">
@@ -1567,6 +1730,8 @@ def agent_rejected(request: Request):
                     </form>
                 </div>
             </div>"""
+    elif filters["q"]:
+        cards_html = _no_matches_html(filters, "turned down")
     else:
         cards_html = ui.empty_state(
             "Nothing turned down",
@@ -1609,14 +1774,22 @@ def agent_history(request: Request):
         rows.extend(review_queue.list_rows(
             status=st, task_type=filters["task_type"], source=filters["source"],
             confidence=filters["confidence"], has_safety_flags=flagged_only,
+            q=filters["q"] or "",
         ))
+    approved_total = review_queue.count_rows(status=Status.APPROVED)
+    unpublished_total = review_queue.count_rows(status=Status.APPROVED, published=False)
     rows.sort(key=lambda r: r.get("reviewed_at") or "", reverse=True)
     total = len(rows)
     rows = rows[offset:offset + page_size]
 
-    cards_html = "" if rows else ui.empty_state("Nothing checked yet",
-                                                 "Descriptions you approve or turn down will be "
-                                                 "listed here.")
+    can_publish = _can(request, auth.PERM_RUN_JOBS)
+    if rows:
+        cards_html = ""
+    elif filters["q"]:
+        cards_html = _no_matches_html(filters, "already checked")
+    else:
+        cards_html = ui.empty_state("Nothing checked yet",
+                                     "Descriptions you approve or turn down will be listed here.")
     for row in rows:
         approved = row["status"] == Status.APPROVED
         status_badge = (f'<span class="badge {"live" if approved else "confidence-low"}">'
@@ -1634,17 +1807,21 @@ def agent_history(request: Request):
         if row.get("edited"):
             note_html += '<div class="meta">&#9998; Edited by a reviewer before approval</div>'
 
+        pick = "" if not (approved and can_publish) else (
+            f'<input type="checkbox" class="row-check checkbox-col" name="id" value="{row["id"]}" '
+            f'form="publish-form" title="Select to send to Odoo">')
         cards_html += f"""
         <div class="card">
             <div class="card-header">
                 <div class="card-header-left">
+                    {pick}
                     <span class="title">{html.escape(row['title'])}</span>
                     <span class="badge {row['task_type']}">{row['task_type']}</span>
                     {status_badge}
                 </div>
                 <div class="meta">SKU {html.escape(str(row['product_id']))}</div>
             </div>
-            <div class="meta">Reviewed: {html.escape(str(row.get('reviewed_at') or '--'))}
+            <div class="meta">Reviewed: {html.escape(au_datetime(row.get('reviewed_at')))}
                 {f"by <b>{html.escape(row['reviewed_by'])}</b>" if row.get('reviewed_by') else ''}</div>
             {note_html}{published_html}
             <div class="actions">
@@ -1658,10 +1835,198 @@ def agent_history(request: Request):
         </div>"""
 
     query_state = {k: v for k, v in filters.items() if k != "page"}
-    inner = (f'{_filter_bar_html(filters, f"{CONTENT_AGENT}/history")}{cards_html}'
+    inner = (f'{_publish_bar_html(can_publish, approved_total, unpublished_total)}'
+             f'{_export_panel_html(request)}'
+             f'{_filter_bar_html(filters, f"{CONTENT_AGENT}/history")}{cards_html}'
              f'{_pagination_html(f"{CONTENT_AGENT}/history", query_state, filters["page"], total, page_size)}')
     return _agent_page(request, "history", inner,
                         "Everything you have already checked, and what happened to it.")
+
+
+# ---------------------------------------------------------------------------
+# Sending approved descriptions to Odoo in bulk
+#
+# The staging-to-live move: everything approved has been written against one
+# Odoo, and the same copy now has to go to another. Admin-only, like every
+# other job, because it writes to a live shop a few hundred products at a time.
+# ---------------------------------------------------------------------------
+PUBLISH_SCOPES = {
+    "selected": "the ones ticked below",
+    "unpublished": "every approved description not on a product page yet",
+    "all": "every approved description",
+}
+
+
+def _publish_rows_for(scope: str, selected: list[int]) -> list[int]:
+    if scope == "selected":
+        approved = {r["id"] for r in review_queue.list_rows(status=Status.APPROVED)}
+        return [row_id for row_id in selected if row_id in approved]
+    published = False if scope == "unpublished" else None
+    return [r["id"] for r in review_queue.list_rows(status=Status.APPROVED, published=published)]
+
+
+def _publish_bar_html(can_publish: bool, approved_total: int, unpublished_total: int) -> str:
+    if not can_publish:
+        return ""
+    target = _odoo_target()
+    if _publish_state["running"]:
+        done, total = _publish_state["done"], max(1, _publish_state["total"])
+        return f"""
+        <div class="fetch-bar">
+          <button class="btn-accent" type="button" disabled><span class="spinner"></span>
+            Sending {done} of {_publish_state["total"]}...</button>
+          <span class="meta">Sending approved descriptions to Odoo
+            (<b>{_publish_state["target"]}</b>), about {done * 100 // total}% through. This page
+            updates on its own.</span>
+        </div>"""
+
+    last = _publish_state["last_result"]
+    status = ""
+    if last:
+        bits = [f'<b>Last send:</b> {last["sent"]} to Odoo ({html.escape(str(last["target"]))})']
+        if last["failed"]:
+            bits.append(f'{last["failed"]} failed -- they are under <b>Did not send</b>')
+        if last["skipped"]:
+            bits.append(f'{last["skipped"]} skipped (no longer approved, or nothing written)')
+        status = " &middot; ".join(bits)
+        if last.get("aborted"):
+            status = f'<div class="flags">{html.escape(last["aborted"])}</div>{status}'
+        elif last.get("error"):
+            status = f'<div class="flags">The send stopped: {html.escape(last["error"])}</div>{status}'
+    elif not odoo_connector.is_configured():
+        status = ("Odoo is not set up on this server, so nothing can be sent. "
+                  "Check the connection settings in <code>.env</code>.")
+    else:
+        status = ("Use this after switching Odoo from staging to live: it sends the approved "
+                  "copy to whichever Odoo this dashboard is pointed at now.")
+
+    body = (f"Writes to Odoo: {target}. Each product's description is overwritten with the "
+            "approved version. Photos already uploaded are not sent again. Products are done one "
+            f"at a time, and the run stops early if {PUBLISH_ABORT_AFTER} in a row fail.")
+    return f"""
+    <form method="post" action="{CONTENT_AGENT}/bulk/publish" id="publish-form" style="display:contents"></form>
+    <div class="fetch-bar" style="flex-wrap:wrap">
+      <button class="publish" type="submit" form="publish-form" data-needs-selection
+              {_confirm("Send {n} description{s} to Odoo?", body=body,
+                        ok="Send {n}", tone="warn", count=SELECTED)}>&#8593; Send selected</button>
+      <button class="btn-ghost" type="submit" form="publish-form" name="scope" value="unpublished"
+              {_confirm(f"Send the {unpublished_total} not on a product page yet?", body=body,
+                        ok="Send them", tone="warn")}>&#8593; Send the {unpublished_total} never sent</button>
+      <button class="btn-ghost" type="submit" form="publish-form" name="scope" value="all"
+              {_confirm(f"Send all {approved_total} approved descriptions to Odoo?",
+                        body="This includes descriptions already sent once: each is overwritten "
+                             f"with the approved version. {body}",
+                        ok=f"Send all {approved_total}", tone="danger")}>&#8593; Send all {approved_total} (re-sends)</button>
+      <span class="meta" style="flex:1 1 320px">Sends to Odoo <b>{html.escape(target)}</b>. {status}</span>
+    </div>"""
+
+
+@app.post(f"{CONTENT_AGENT}/bulk/publish")
+def bulk_publish_rows(request: Request, background_tasks: BackgroundTasks,
+                       id: list[int] = Form(default=[]), scope: str = Form(default="selected")):
+    back = f"{CONTENT_AGENT}/history"
+    denied = _denied(request, auth.PERM_RUN_JOBS, back)
+    if denied:
+        return denied
+    if scope not in PUBLISH_SCOPES:
+        return _redirect(back, err="Choose what to send from the buttons on this page.")
+    if _publish_state["running"]:
+        return _redirect(back, err="A send to Odoo is already going. This page updates on its own.")
+    if not odoo_connector.is_configured():
+        return _redirect(back, err="Odoo is not set up on this server, so nothing was sent.")
+
+    row_ids = _publish_rows_for(scope, id)
+    if not row_ids:
+        return _redirect(back, err="Nothing to send: none of those are approved descriptions.")
+
+    target = _odoo_target()
+    _publish_state.update({"running": True, "started_at": datetime.now(timezone.utc),
+                           "total": len(row_ids), "done": 0, "last_result": None,
+                           "target": target})
+    _audit(request, "bulk_published", None,
+           detail=f"Sending {len(row_ids)} approved description(s) to Odoo ({target}): "
+                  f"{PUBLISH_SCOPES[scope]}.")
+    background_tasks.add_task(_run_publish_job, row_ids, _actor(request), target)
+    return _redirect(back, msg=f"Sending {len(row_ids)} description(s) to Odoo ({target}). "
+                               f"This page updates on its own.")
+
+
+# ---------------------------------------------------------------------------
+# Content Agent -- exporting approved descriptions
+#
+# Admin only. A download changes nothing, so it is a plain GET with no
+# confirmation dialog, but it is recorded in the activity log: it takes the
+# whole approved catalogue off the server.
+# ---------------------------------------------------------------------------
+EXPORT_PATH = f"{CONTENT_AGENT}/export"
+
+
+def _export_panel_html(request: Request) -> str:
+    if not _can(request, auth.PERM_ADMINISTER):
+        return ""
+    total = review_queue.count_rows(status=Status.APPROVED)
+    published = review_queue.count_rows(status=Status.APPROVED, published=True)
+    counts = {description_export.SCOPE_ALL: total,
+              description_export.SCOPE_PUBLISHED: published,
+              description_export.SCOPE_UNPUBLISHED: total - published}
+
+    def options(choices: dict, with_counts: bool = False) -> str:
+        out = ""
+        for value, label in choices.items():
+            if with_counts:
+                disabled = "" if counts[value] else " disabled"
+                out += f'<option value="{value}"{disabled}>{html.escape(label)} ({counts[value]})</option>'
+            else:
+                out += f'<option value="{value}">{html.escape(label)}</option>'
+        return out
+
+    if not total:
+        return ('<div class="fetch-bar"><span class="meta"><b>Download approved descriptions</b> '
+                '&middot; Nothing approved yet. Approved descriptions can be downloaded here as '
+                'Excel or CSV.</span></div>')
+    return f"""
+    <form class="filter-bar" method="get" action="{EXPORT_PATH}">
+        <b style="align-self:center">Download approved descriptions</b>
+        <label>Which
+            <select name="scope">{options(description_export.SCOPES, with_counts=True)}</select>
+        </label>
+        <label>Description as
+            <select name="text">{options(description_export.TEXTS)}</select>
+        </label>
+        <label>File
+            <select name="file">{options(description_export.FORMATS)}</select>
+        </label>
+        <button class="btn-primary" type="submit">&#8595; Download</button>
+        <span class="meta" style="align-self:center">SKU, product name and description, one product per row.</span>
+    </form>"""
+
+
+@app.get(EXPORT_PATH)
+def export_descriptions(request: Request, scope: str = description_export.SCOPE_ALL,
+                        text: str = description_export.TEXT_PLAIN,
+                        file: str = description_export.FORMAT_XLSX):
+    back = f"{CONTENT_AGENT}/history"
+    denied = _denied(request, auth.PERM_ADMINISTER, back)
+    if denied:
+        return denied
+    try:
+        result = description_export.build(scope=scope, fmt=file, text=text)
+    except ValueError:
+        return _redirect(back, err="Choose what to download from the options on this page.")
+    if not result["count"]:
+        return _redirect(back, err="There are no approved descriptions to download for that choice.")
+
+    detail = (f"{result['count']} description(s): {description_export.SCOPES[scope].lower()}, "
+              f"{description_export.TEXTS[text].lower()}, {file.upper()}")
+    if result["skipped"]:
+        detail += f". {result['skipped']} approved row(s) had no description and were left out"
+    if result["truncated"]:
+        detail += f". {result['truncated']} cell(s) cut to Excel's length limit"
+    _audit(request, "descriptions_exported", detail=detail + ".")
+    return Response(content=result["content"], media_type=result["media_type"], headers={
+        "Content-Disposition": f'attachment; filename="{result["filename"]}"',
+        "Cache-Control": "no-store",
+    })
 
 
 # ---------------------------------------------------------------------------
@@ -1718,6 +2083,23 @@ def _apply_draft_edits(row_id: int, overview: str | None, features: str | None,
 
     if new_parsed != (row.get("parsed_output") or {}):
         review_queue.update_parsed_output(row_id, new_parsed)
+
+
+def _odoo_target() -> str:
+    """Which Odoo a publish writes to: "staging - database - host".
+
+    Plain text, no markup: it goes into the confirmation dialog, which sets its
+    body as text (see SHARED_JS), so any tag or entity would be read out
+    literally. The page wraps it in its own markup where that is wanted.
+
+    Shown on the button and repeated in its confirmation because the same
+    button pushes to staging today and to the live shop tomorrow, and the only
+    difference is a line in .env that nobody can see from this page.
+    """
+    if not odoo_connector.is_configured():
+        return "not set up"
+    host = (odoo_connector.url or "").split("://")[-1].strip("/")
+    return f"{odoo_connector.env_name} · {odoo_connector.db} · {host}"
 
 
 def _attempt_publish(row_id: int) -> dict[Any, Any] | None:
@@ -2182,6 +2564,53 @@ def _chat_run_bar_html(can_run: bool = True) -> str:
     </div>"""
 
 
+def _report_pdf_button(run: dict) -> str:
+    """Download the week's report as a PDF -- the same document that was
+    emailed, printed by the browser on this server."""
+    if not run.get("report_html"):
+        return ""
+    ready, detail = report_pdf.is_available()
+    if not ready:
+        return (f'<span class="meta" title="{html.escape(detail, quote=True)}">'
+                f'PDF download unavailable on this server.</span>')
+    return (f'<a class="btn-ghost" style="padding:6px 13px;text-decoration:none;border-radius:8px" '
+            f'href="{CHAT_INSIGHTS}/run/{run["id"]}/report.pdf" '
+            f'title="The report as it was emailed, as a PDF">&#8595; Download PDF</a>')
+
+
+def _report_pdf_name(run: dict) -> str:
+    start = (run.get("week_start") or "").strip() or "report"
+    end = (run.get("week_end") or "").strip()
+    return f"bc-sands-chat-report-{start}{('-to-' + end) if end else ''}.pdf"
+
+
+@app.get(CHAT_INSIGHTS + "/run/{run_id}/report.pdf")
+def chat_insights_report_pdf(request: Request, run_id: int):
+    """The stored report, printed to PDF. Read-only, so anyone who can open
+    Chat Insights can take one -- it is the same document they can already
+    read on screen. Recorded, because it leaves the building as a file with
+    customer details in it."""
+    back = f"{CHAT_INSIGHTS}/run/{run_id}"
+    run = chat_db.get_run(run_id)
+    if not run:
+        return _redirect(CHAT_INSIGHTS, err="That report is no longer here.")
+    if not run.get("report_html"):
+        return _redirect(back, err="This run did not produce a report, so there is nothing to "
+                                   "make a PDF from.")
+    try:
+        data = report_pdf.render(run["report_html"])
+    except report_pdf.PdfError as e:
+        logger.exception("Report PDF failed for run %s", run_id)
+        return _redirect(back, err=str(e))
+    _audit(request, "report_downloaded", None,
+           detail=f"Downloaded the chat report for {au_day(run.get('week_start'))} as a PDF "
+                  f"({len(data) // 1024} KB).")
+    return Response(content=data, media_type="application/pdf", headers={
+        "Content-Disposition": f'attachment; filename="{_report_pdf_name(run)}"',
+        "Cache-Control": "no-store",
+    })
+
+
 def _chat_email_button(run: dict, label: str = "Send by email",
                         can_send: bool = True) -> str:
     """Manual send for a report that already exists -- for a week whose
@@ -2237,12 +2666,12 @@ def chat_insights_home(request: Request):
                              else f'<span class="badge confidence-low">{html.escape(r["status"])}</span>')
             rows += f"""
             <tr>
-              <td><b>{html.escape(r["week_start"])}</b> to {html.escape(r["week_end"])}
+              <td><b>{html.escape(au_day(r["week_start"]))}</b> to {html.escape(au_day(r["week_end"]))}
                   {' <span class="badge planned">partial</span>' if r.get("truncated") else ''}</td>
               <td>{r.get("conversation_count", 0)}</td>
               <td>{status_badge}</td>
               <td>{email_badge}</td>
-              <td class="meta">{html.escape(str(r.get("finished_at") or r.get("started_at") or ""))[:19]}</td>
+              <td class="meta">{html.escape(au_datetime(r.get("finished_at") or r.get("started_at")))}</td>
               <td style="white-space:nowrap">
                   <a class="btn-ghost" style="padding:5px 12px;text-decoration:none;border-radius:8px"
                      href="{CHAT_INSIGHTS}/run/{r['id']}">View report</a>
@@ -2314,16 +2743,17 @@ def chat_insights_report(request: Request, run_id: int):
         cls = "meta" if run["email_status"] == "sent" else "dry-run-note"
     email_note = (f'<div class="{cls}" style="display:flex;gap:12px;align-items:center;'
                    f'flex-wrap:wrap"><span>Email: {status_text}</span>'
-                   f'{_chat_email_button(run, can_send=_can(request, auth.PERM_SEND_MAIL))}</div>')
+                   f'{_chat_email_button(run, can_send=_can(request, auth.PERM_SEND_MAIL))}'
+                   f'{_report_pdf_button(run)}</div>')
 
     body = f"""
     <div class="page-head">
       <div>
-        <h1>Week of {html.escape(run["week_start"])}</h1>
+        <h1>Week of {html.escape(au_day(run["week_start"]))}</h1>
         <p class="subtitle">
            <a href="{CHAT_INSIGHTS}/run/{run_id}/conversations">{run.get("conversation_count", 0)}
            conversations</a>
-           &middot; {html.escape(run["week_start"])} to {html.escape(run["week_end"])}</p>
+           &middot; {html.escape(au_day(run["week_start"]))} to {html.escape(au_day(run["week_end"]))}</p>
       </div>
     </div>
     {email_note}
@@ -2333,7 +2763,7 @@ def chat_insights_report(request: Request, run_id: int):
                           active_module="chat-insights", user=_current_user(request),
                           request=request, crumbs=[
                               ("Chat Insights", CHAT_INSIGHTS),
-                              (f"Week of {run['week_start']}", "")])
+                              (f"Week of {au_day(run['week_start'])}", "")])
 
 
 def _sentiment_badge(analysis: dict) -> str:
@@ -2371,7 +2801,7 @@ def chat_insights_conversations(request: Request, run_id: int):
             flags += ' <span class="badge live">lead</span>'
         if c.get("negative_feedback"):
             flags += ' <span class="badge confidence-low">thumbs down</span>'
-        when = datetime.fromtimestamp(int(c["created_at"] or 0), timezone.utc).strftime("%Y-%m-%d %H:%M")
+        when = au_datetime(c["created_at"])
         rows += f"""
         <tr>
           <td class="meta" style="white-space:nowrap">{html.escape(when)}</td>
@@ -2400,7 +2830,7 @@ def chat_insights_conversations(request: Request, run_id: int):
     body = f"""
     <div class="page-head">
       <div>
-        <h1>Conversations, week of {html.escape(run["week_start"])}</h1>
+        <h1>Conversations, week of {html.escape(au_day(run["week_start"]))}</h1>
         <p class="subtitle">{len(conversations)} conversations</p>
       </div>
     </div>
@@ -2412,7 +2842,7 @@ def chat_insights_conversations(request: Request, run_id: int):
                           active_module="chat-insights", user=_current_user(request),
                           request=request, crumbs=[
                               ("Chat Insights", CHAT_INSIGHTS),
-                              (f"Week of {run['week_start']}", f"{CHAT_INSIGHTS}/run/{run_id}"),
+                              (f"Week of {au_day(run['week_start'])}", f"{CHAT_INSIGHTS}/run/{run_id}"),
                               ("Conversations", "")])
 
 
@@ -2462,13 +2892,13 @@ def chat_insights_conversation(request: Request, conversation_id: str):
         badges = ('<span class="badge planned">not analysed</span>'
                   ' <span class="meta">too few messages to be worth a generation</span>')
 
-    when = datetime.fromtimestamp(int(conv.get("created_at") or 0), timezone.utc)
+    when = au_datetime(conv.get("created_at"))
     # The trail depends on whether this conversation still belongs to a run --
     # once a run's data is cleared, Chat Insights is as far up as it goes.
     crumbs = [("Chat Insights", CHAT_INSIGHTS)]
     run = chat_db.get_run(conv["run_id"]) if conv.get("run_id") else None
     if run:
-        crumbs.append((f"Week of {run['week_start']}", f"{CHAT_INSIGHTS}/run/{run['id']}"))
+        crumbs.append((f"Week of {au_day(run['week_start'])}", f"{CHAT_INSIGHTS}/run/{run['id']}"))
         crumbs.append(("Conversations", f"{CHAT_INSIGHTS}/run/{run['id']}/conversations"))
     crumbs.append((analysis.get("topic") or "Conversation", ""))
 
@@ -2476,7 +2906,7 @@ def chat_insights_conversation(request: Request, conversation_id: str):
     <div class="page-head">
       <div>
         <h1>{html.escape(analysis.get("topic") or "Conversation")}</h1>
-        <p class="subtitle">{when:%Y-%m-%d %H:%M} UTC &middot;
+        <p class="subtitle">{html.escape(when)} &middot;
            {html.escape(conv.get("source") or "unknown source")} &middot;
            {conv.get("message_count", 0)} messages</p>
       </div>
@@ -2547,115 +2977,130 @@ DIGEST_STATUS = {
 }
 
 
-def _digest_row_html(day: str, digest: dict | None, untracked: bool = False) -> str:
-    """One morning, in one of three states.
+def _lead_run_row_html(when: datetime, covers_from: datetime | None, run: dict | None,
+                       state: str) -> str:
+    """One lead email run -- a scheduled slot, or one a person started.
 
-    A day with no run is the row worth having -- but only once there is a run
-    to compare it against. Days before the first recorded one are shown greyed
-    rather than red: nothing failed then, we simply were not watching.
+    A slot with no run is the row worth having, but only once there is a run to
+    compare it against: slots before the first recorded one are greyed, not
+    red, because nothing failed then -- we simply were not watching.
     """
-    if not digest and untracked:
+    label = f"{when:%a} {when.day} {when:%b}, {au_time(when)}"
+    covers = (f"{au_time(covers_from)} to {au_time(when)}" if covers_from else "--")
+    if not run:
+        badge, detail = {
+            "untracked": ('<span class="badge planned">Not tracked</span>',
+                          "Before this dashboard recorded lead runs at these times."),
+            "due": ('<span class="badge draft">Due now</span>',
+                    "Its time has just passed; the run may still be going."),
+        }.get(state, ('<span class="badge confidence-low">Did not run</span>',
+                      "No record of this run. Its leads go out with the next one, or use "
+                      "<b>Send lead email now</b>."))
         return f"""
         <tr>
-          <td class="meta" style="white-space:nowrap">{html.escape(day)}</td>
-          <td><span class="badge planned">Not tracked</span></td>
-          <td class="meta">--</td><td class="meta">--</td>
-          <td class="meta">Before this dashboard started recording the morning email.</td>
-        </tr>"""
-    if not digest:
-        return f"""
-        <tr>
-          <td class="meta" style="white-space:nowrap">{html.escape(day)}</td>
-          <td><span class="badge confidence-low">Did not run</span></td>
-          <td class="meta">--</td><td class="meta">--</td>
-          <td class="meta">No record of this morning's job. Use
-              <b>Send the morning email</b> to cover it now.</td>
+          <td style="white-space:nowrap"><b>{html.escape(label)}</b></td>
+          <td class="meta" style="white-space:nowrap">{html.escape(covers)}</td>
+          <td>{badge}</td><td class="meta">--</td>
+          <td class="meta">{detail}</td>
         </tr>"""
 
-    label, badge = DIGEST_STATUS.get(digest.get("email_status") or "",
-                                      (digest.get("email_status") or "unknown", "planned"))
-    manual = ""
-    if digest.get("run_trigger") in (chat_db.TRIGGER_MANUAL, chat_db.TRIGGER_COMMAND_LINE):
-        who = digest.get("triggered_by") or "someone"
-        manual = f' <span class="badge role">by hand &middot; {html.escape(who)}</span>'
-    waiting = ""
-    if digest.get("waiting"):
-        waiting = (f'<div class="meta">{digest["waiting"]} promised a callback '
-                    f'the hand-off never made</div>')
-    detail = digest.get("email_detail") or ""
-    if digest.get("error"):
-        detail = (detail + " " if detail else "") + digest["error"]
-    ran = (digest.get("ran_at") or "")[:16].replace("T", " ")
+    status_label, badge = DIGEST_STATUS.get(run.get("email_status") or "",
+                                            (run.get("email_status") or "unknown", "planned"))
+    tags = ""
+    if (run.get("error") or "").startswith("Another lead run"):
+        status_label, badge = "Skipped -- another run was going", "planned"
+    if run.get("run_trigger") in (chat_db.TRIGGER_MANUAL, chat_db.TRIGGER_COMMAND_LINE):
+        tags += (f' <span class="badge role">by hand &middot; '
+                 f'{html.escape(run.get("triggered_by") or "someone")}</span>')
+    notes = []
+    if run.get("waiting"):
+        notes.append(f"{run['waiting']} promised a callback the hand-off never made")
+    if run.get("carried"):
+        notes.append(f"{run['carried']} from earlier, not emailed before")
+    if run.get("refined"):
+        notes.append(f"{run['refined']} tidied by the model")
+    if run.get("deferred"):
+        notes.append(f"{run['deferred']} left for the next run")
+    detail = " ".join(p for p in (run.get("email_detail") or "", run.get("error") or "") if p)
+    took = f" &middot; took {run['duration_ms'] / 1000:.1f} s" if run.get("duration_ms") else ""
     return f"""
     <tr>
-      <td class="meta" style="white-space:nowrap">{html.escape(day)}
-          <div class="meta">ran {html.escape(ran)}</div></td>
-      <td><span class="badge {badge}">{html.escape(label)}</span>{manual}</td>
-      <td><b>{digest.get("reported", 0)}</b>{waiting}</td>
-      <td class="meta">{html.escape(digest.get("recipients") or "--")}</td>
-      <td class="meta">{html.escape(detail)}</td>
+      <td style="white-space:nowrap"><b>{html.escape(label)}</b>
+          <div class="meta">ran {html.escape(au_time(run.get("ran_at")))}{took}</div></td>
+      <td class="meta" style="white-space:nowrap">{html.escape(covers)}</td>
+      <td><span class="badge {badge}">{html.escape(status_label)}</span>{tags}</td>
+      <td><b>{run.get("reported", 0)}</b>
+          {''.join(f'<div class="meta">{html.escape(n)}</div>' for n in notes)}</td>
+      <td class="meta">{html.escape(detail)}
+          {f'<div>To {html.escape(run["recipients"])}</div>' if run.get("recipients") else ''}</td>
     </tr>"""
 
 
 def _lead_digest_panel(can_send: bool = True) -> str:
-    """The last two weeks of morning emails, and the button to run one now.
+    """Today's and yesterday's lead email runs, and the button to send one now.
 
     Worth its own panel rather than a line in the job log. The leads list above
-    says who needs calling; this says whether anyone was told. A morning that
-    silently did not run looks exactly like a morning with no leads unless the
-    days are laid out and the gap is visible.
+    says who needs calling; this says whether anyone was told. A run that
+    silently did not happen looks exactly like one with no leads unless the
+    slots are laid out and the gap is visible.
     """
-    days = chat_daily.coverage(14)
-    missing = [d["day"] for d in days if not d["digest"] and not d["untracked"]]
+    coverage = chat_daily.slot_coverage(2)
+    missed = [c for c in coverage if c["state"] == "missed"]
     recipients = mailer.recipients_for("daily_leads")
+    today = datetime.now(timezone.utc)
+    times = ", ".join(au_time(s) for s in chat_daily._slots_on(to_au(today).date()))
 
-    if missing:
-        # Named rather than counted: "3 mornings" sends nobody anywhere, but a
-        # date is something you can go and cover.
-        shown = ", ".join(missing[:4]) + (" and others" if len(missing) > 4 else "")
-        banner = (f'<div class="flags"><b>No lead email went out for {shown}.</b> '
-                   f'Leads from those days are still in the list above -- nobody was '
-                   f'sent them. Run it now to cover the most recent day.</div>')
-    elif any(d["digest"] for d in days):
-        banner = ('<div class="meta">Every morning since tracking started is accounted '
-                   'for.</div>')
+    if missed:
+        # Named rather than counted: "2 runs" sends nobody anywhere, but a time
+        # is something you can check.
+        shown = ", ".join(f"{c['slot']:%a} {au_time(c['slot'])}" for c in missed[:4])
+        banner = (f'<div class="flags"><b>No lead email went out for the {shown} '
+                  f'run{"s" if len(missed) > 1 else ""}.</b> Their leads are in the list above '
+                  f'and go out with the next run, or send them now.</div>')
+    elif any(c["run"] for c in coverage):
+        banner = '<div class="meta">Every run since tracking started is accounted for.</div>'
     else:
-        banner = ('<div class="meta">No morning email has run since this dashboard '
-                   'started recording them. The first scheduled run will appear here.</div>')
+        banner = ('<div class="meta">No lead email has run at the new times yet. The first '
+                  'scheduled run will appear here.</div>')
 
     if recipients:
         who = ", ".join(recipients)
-        confirm_body = (f"Fetches yesterday's conversations, finds the leads and emails "
-                         f"the call list to {who}. Takes a few seconds. Safe to run twice "
-                         f"-- they would simply get the same list again.")
+        confirm_body = (f"Fetches the latest chats from Chatbase, finds the leads and emails "
+                        f"{who} every lead since the last scheduled run that has not been "
+                        f"emailed yet. Leads already sent are not sent again.")
     else:
         who = "nobody -- no daily_leads recipients are configured"
-        confirm_body = ("No recipients are configured for the daily lead digest, so "
-                         "nothing will be emailed. The run still fetches yesterday's "
-                         "conversations and records the leads it finds.")
+        confirm_body = ("No recipients are configured for lead emails, so nothing will be "
+                        "emailed. The run still fetches the latest chats and records the "
+                        "leads it finds.")
 
     send_button = "" if not can_send else f"""
         <form method="post" action="{CHAT_INSIGHTS}/leads/run-daily" style="margin:0">
           <button class="btn-accent" type="submit"
-                  {_confirm("Send the morning lead email now?", body=confirm_body,
-                             ok="Run it now", tone="warn")}>&#9993; Send the morning email</button>
+                  {_confirm("Send the lead email now?", body=confirm_body,
+                            ok="Send it now", tone="warn")}>&#9993; Send lead email now</button>
         </form>"""
 
-    rows = "".join(_digest_row_html(d["day"], d["digest"], d["untracked"]) for d in days)
+    entries = [(c["slot"], c["window_start"], c["run"], c["state"]) for c in coverage]
+    for run in chat_daily.other_runs(2):
+        entries.append((to_au(run["window_end_at"]), to_au(run.get("window_start_at")), run, "ran"))
+    entries.sort(key=lambda e: e[0], reverse=True)
+    rows = "".join(_lead_run_row_html(*entry) for entry in entries)
     return f"""
     <div class="panel">
       <div class="page-head" style="margin-bottom:10px">
         <div>
-          <h2 style="margin:0">Morning lead emails</h2>
-          <p class="subtitle" style="margin:4px 0 0">One per day, covering the day
-             before. Goes to {html.escape(who)}.</p>
+          <h2 style="margin:0">Lead emails</h2>
+          <p class="subtitle" style="margin:4px 0 0">Every day at {html.escape(times)}
+             (Sydney time). Each email has the leads from chats since the run before, and
+             goes to {html.escape(who)}. No leads, no email.</p>
         </div>
         {send_button}
       </div>
       {banner}
       <table class="grid">
-        <tr><th>Day covered</th><th>Email</th><th>Leads</th><th>To</th><th>Detail</th></tr>
-        {rows}
+        <tr><th>Run</th><th>Covers</th><th>Email</th><th>Leads</th><th>Detail</th></tr>
+        {rows or '<tr><td colspan="5" class="meta">No runs yet.</td></tr>'}
       </table>
     </div>"""
 
@@ -2719,31 +3164,12 @@ def chat_insights_leads(request: Request, lead_type: str = "", category: str = "
                             key=lambda kv: list(HANDOFF_LABELS).index(kv[0])
                             if kv[0] in HANDOFF_LABELS else 9) if h)
 
+    can_set_status = _can(request, auth.PERM_WORK_LEADS)
     rows = ""
     for lead in rows_data:
-        when = datetime.fromtimestamp(int(lead["created_at"] or 0), timezone.utc)
+        when = au_datetime(lead["created_at"])
         lead_status = lead.get("status") or "new"
-        crm = ""
-        if lead.get("lead_type") == "form_submission" and lead.get("crm_status") != "present":
-            # The only type where a hand-off was supposed to happen.
-            crm = ' <span class="badge confidence-low">check CRM</span>'
-        rows += f"""
-        <tr>
-          <td class="meta" style="white-space:nowrap">{when:%Y-%m-%d %H:%M}</td>
-          <td><span class="badge {lead["lead_type"]}">
-                {html.escape(LEAD_TYPE_LABELS.get(lead["lead_type"], lead["lead_type"]))}</span>
-              {_handoff_badge(lead)}{crm}
-              {f'<div class="meta" style="max-width:34ch">&ldquo;{html.escape(lead["claim_excerpt"])}&rdquo;</div>'
-                if lead.get("claim_excerpt") and lead.get("handoff_state") == "claimed_not_fired" else ''}</td>
-          <td>{_lead_contact_html(lead)}</td>
-          <td><b>{html.escape(lead.get("topic") or "--")}</b>
-              <div class="meta">{html.escape(lead.get("detail") or "")}</div></td>
-          <td class="meta">{html.escape((lead.get("category") or "").replace("_", " "))}</td>
-          <td><span class="badge status-{html.escape(lead_status)}">{html.escape(lead_status)}</span>
-              {f'<div class="meta">{html.escape(lead.get("owner") or "")}</div>' if lead.get("owner") else ''}</td>
-          <td style="white-space:nowrap">
-            <a class="btn-ghost" style="padding:5px 10px;text-decoration:none;border-radius:8px"
-               href="{CHAT_INSIGHTS}/conversation/{html.escape(lead["conversation_id"])}">Chat</a>
+        status_form = "" if not can_set_status else f"""
             <form method="post" action="{CHAT_INSIGHTS}/leads/{html.escape(lead["conversation_id"])}/status"
                   style="display:inline-flex;gap:4px;margin:0">
               <select name="status" style="padding:4px 6px;font-size:12px">
@@ -2756,7 +3182,31 @@ def chat_insights_leads(request: Request, lead_type: str = "", category: str = "
                                  what=(lead.get("contact_name") or lead.get("contact_phone")
                                         or lead.get("contact_email") or lead["conversation_id"]),
                                  ok="Save")}>Save</button>
-            </form>
+            </form>"""
+        # There was a "check CRM" badge here on every form submission. Nothing
+        # ever recorded a CRM check, so it showed for the life of the lead and
+        # nobody could clear it -- a warning that cannot be acted on teaches
+        # people to ignore warnings.
+        rows += f"""
+        <tr>
+          <td class="meta" style="white-space:nowrap">{html.escape(when)}</td>
+          <td><span class="badge {lead["lead_type"]}">
+                {html.escape(LEAD_TYPE_LABELS.get(lead["lead_type"], lead["lead_type"]))}</span>
+              {_handoff_badge(lead)}
+              {f'<div class="meta" style="max-width:34ch">&ldquo;{html.escape(lead["claim_excerpt"])}&rdquo;</div>'
+                if lead.get("claim_excerpt") and lead.get("handoff_state") == "claimed_not_fired" else ''}</td>
+          <td>{_lead_contact_html(lead)}</td>
+          <td><b>{html.escape(lead.get("topic") or "--")}</b>
+              <div class="meta">{html.escape(lead.get("detail") or "")}</div></td>
+          <td class="meta">{html.escape((lead.get("category") or "").replace("_", " "))}</td>
+          <td><span class="badge status-{html.escape(lead_status)}">{html.escape(lead_status)}</span>
+              {f'<div class="meta">{html.escape(lead.get("owner") or "")}</div>' if lead.get("owner") else ''}</td>
+          <td style="white-space:nowrap">
+            <a class="btn-ghost" style="padding:5px 10px;text-decoration:none;border-radius:8px"
+               href="{CHAT_INSIGHTS}/leads/{html.escape(lead["conversation_id"])}">Open</a>
+            <a class="btn-ghost" style="padding:5px 10px;text-decoration:none;border-radius:8px"
+               href="{CHAT_INSIGHTS}/conversation/{html.escape(lead["conversation_id"])}">Chat</a>
+            {status_form}
           </td>
         </tr>"""
 
@@ -2777,18 +3227,25 @@ def chat_insights_leads(request: Request, lead_type: str = "", category: str = "
             "A chat becomes a lead when the customer leaves a phone number or an email "
             "address. Use “Check for leads” to look through the chats already saved.")
 
-    # Reviewers may scan; only somebody who can send mail is told that alerts
-    # go out, because for anyone else they do not.
-    sync_note = ("Looks through every chat saved here for a phone number or an email "
-                  "address. Anything new is added to the list below.")
+    # Reviewers and sales may check; only somebody who can send mail is told
+    # that alerts go out, because for anyone else they do not.
+    sync_note = ("Fetches the latest chats from Chatbase and looks for phone numbers and "
+                 "email addresses. New leads are added to the list below. No lead email is "
+                 "sent. Usually takes a few seconds; the page refreshes itself when it is done.")
     if _can(request, auth.PERM_SEND_MAIL):
         sync_note += " New leads also trigger an alert email if alerts are switched on."
-    sync_button = "" if not _can(request, auth.PERM_FIND_LEADS) else f"""
+    checking = _lead_check_in_progress()
+    if checking:
+        sync_button = ('<button class="btn-accent" type="button" disabled>'
+                       '<span class="spinner"></span> Checking...</button>')
+    else:
+        sync_button = "" if not _can(request, auth.PERM_FIND_LEADS) else f"""
       <form method="post" action="{CHAT_INSIGHTS}/leads/sync" style="margin:0">
         <button class="btn-accent" type="submit"
-                {_confirm("Check the saved chats for leads?", body=sync_note,
-                           ok="Check now")}>&#8635; Check for leads</button>
+                {_confirm("Check Chatbase for new leads?", body=sync_note,
+                          ok="Check now")}>&#8635; Check for leads</button>
       </form>"""
+    check_status = _lead_check_status_html(checking)
 
     body = f"""
     <div class="page-head">
@@ -2799,6 +3256,7 @@ def chat_insights_leads(request: Request, lead_type: str = "", category: str = "
       </div>
       {sync_button}
     </div>
+    {check_status}
     {tiles}
     <div class="panel" style="display:flex;flex-direction:column;gap:8px">
       <div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center">
@@ -2813,55 +3271,97 @@ def chat_insights_leads(request: Request, lead_type: str = "", category: str = "
     {table}
     {_lead_digest_panel(_can(request, auth.PERM_SEND_MAIL))
       if _can(request, auth.PERM_VIEW_MAIL_LOG) else ""}
+    {_lead_test_panel_html(request)}
     """
     return ui.page_shell(body, title="Leads \u00b7 Content and Automation",
                           active_module="chat-insights", user=_current_user(request),
                           request=request, crumbs=[("Chat Insights", CHAT_INSIGHTS),
-                                                    ("Leads", "")])
+                                                    ("Leads", "")],
+                          fetch_running=(checking or _lead_run_in_progress()
+                                         or _lead_test_in_progress()))
+
+
+def _lead_check_status_html(checking: bool) -> str:
+    """One line under the heading: a check going on, or how the last one went."""
+    if checking:
+        return ('<div class="fetch-bar"><span class="meta"><span class="spinner"></span> '
+                'Checking Chatbase for new chats and looking for leads. This page refreshes '
+                'itself until it is done.</span></div>')
+    result = _lead_check_state.get("last_result")
+    if not result:
+        return ""
+    who = html.escape(result.get("by") or "someone")
+    when = html.escape(au_time(result.get("finished_at")))
+    if result.get("skipped"):
+        return (f'<div class="meta" style="margin:-6px 0 12px">Check at {when} by {who} did not '
+                f'start: a lead run was already going. Try again in a minute.</div>')
+    counts = result.get("leads") or {}
+    parts = [f"{result.get('fetched', 0)} chat(s) fetched from Chatbase",
+             f"{counts.get('total', 0)} lead(s) on the list"]
+    if result.get("refined"):
+        parts.append(f"{result['refined']} tidied by the model")
+    if result.get("alerted"):
+        parts.append(f"{result['alerted']} alert(s) emailed")
+    took = (result.get("timings") or {}).get("total")
+    line = (f"Last checked at {when} by {who}: " + ", ".join(parts)
+            + (f". Took {took} s." if took is not None else "."))
+    error = (f'<div class="flags">{html.escape(result["error"])}</div>'
+             if result.get("error") else "")
+    return f'<div class="meta" style="margin:-6px 0 12px">{html.escape(line)}</div>{error}'
+
+
+def _run_lead_check(username: str, can_send_mail: bool):
+    try:
+        result = chat_daily.check_for_leads(triggered_by=username)
+        if can_send_mail and not result.get("skipped"):
+            alerted = chat_alerts.send_lead_alerts()
+            result["alerted"] = alerted.get("sent", 0)
+    except Exception as e:
+        logger.exception("Check for leads failed")
+        result = {"error": f"The check failed: {e}"}
+    result.update(by=username, finished_at=datetime.now(timezone.utc).isoformat())
+    result.pop("preview_html", None)
+    _lead_check_state.update(last_result=result, running=False)
 
 
 @app.post(CHAT_INSIGHTS + "/leads/sync")
-def chat_insights_leads_sync(request: Request):
-    """Rebuilds the lead list from stored conversations, then alerts on anything
-    new. Safe to press at any time: detection fields are refreshed, but status,
-    owner and notes a human set are left alone.
+def chat_insights_leads_sync(request: Request, background_tasks: BackgroundTasks):
+    """Fetches the latest chats from Chatbase and finds the leads, in the
+    background. Safe to press at any time: detection fields are refreshed, but
+    status, owner and notes a human set are left alone. Sends no lead email.
 
-    Open to reviewers, because the scan itself only re-reads chats already
-    held here and updates a list on the same page. The alert email is the one
-    part that leaves the building, so it is sent only for somebody who may
-    send mail -- and a lead that goes un-alerted stays that way, so the next
-    admin scan or the overnight job still picks it up.
+    Open to reviewers and sales. The alert email is the one part that leaves the
+    building, so it is sent only for somebody who may send mail -- and a lead
+    that goes un-alerted stays that way, so an admin or the scheduled job still
+    picks it up.
     """
-    denied = _denied(request, auth.PERM_FIND_LEADS, f"{CHAT_INSIGHTS}/leads")
+    back = f"{CHAT_INSIGHTS}/leads"
+    denied = _denied(request, auth.PERM_FIND_LEADS, back)
     if denied:
         return denied
-    counts = chat_leads.sync()
-    msg = (f"Checked every stored chat. {counts['total']} lead(s) on the list "
-           f"({counts['contact_shared']} left details in the chat itself).")
-    if counts.get("removed"):
-        msg += f" Removed {counts['removed']} with no contact details."
-
-    if _can(request, auth.PERM_SEND_MAIL):
-        alerted = chat_alerts.send_lead_alerts()
-        if alerted.get("sent"):
-            msg += f" {alerted['sent']} alert(s) emailed."
-    return _redirect(f"{CHAT_INSIGHTS}/leads", msg=msg)
+    if _lead_check_in_progress() or chat_daily.lock_busy():
+        return _redirect(back, err="Leads are already being checked. Refresh in a moment.")
+    _lead_check_state.update(running=True, started_at=datetime.now(timezone.utc), last_result=None)
+    background_tasks.add_task(_run_lead_check, _actor(request),
+                              _can(request, auth.PERM_SEND_MAIL))
+    return _redirect(back, msg="Checking Chatbase for new chats and leads. This page refreshes "
+                               "itself when it is done.")
 
 
 def _run_lead_digest(username: str):
     try:
-        result = chat_daily.run_daily(trigger=chat_db.TRIGGER_MANUAL, triggered_by=username)
+        result = chat_daily.run_leads(trigger=chat_db.TRIGGER_MANUAL, triggered_by=username)
         _leads_state["last_result"] = result
     except Exception as e:
-        # run_daily swallows the failures it expects, so anything reaching here
+        # run_leads records the failures it expects, so anything reaching here
         # is unexpected -- and still gets recorded, because a manual run that
         # vanished without trace is exactly what this feature exists to stop.
-        logger.exception("Manual lead digest failed")
+        logger.exception("Manual lead email failed")
         _leads_state["last_result"] = {"error": str(e)}
         try:
+            now_iso = datetime.now(timezone.utc).isoformat(timespec="seconds")
             chat_db.record_lead_digest({
-                "day_end": datetime.now().astimezone().strftime("%Y-%m-%d"),
-                "ran_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+                "ran_at": now_iso, "window_start_at": now_iso, "window_end_at": now_iso,
                 "run_trigger": chat_db.TRIGGER_MANUAL, "triggered_by": username,
                 "email_status": chat_db.EMAIL_FAILED, "error": str(e),
             })
@@ -2884,27 +3384,324 @@ def chat_insights_leads_run_daily(request: Request, background_tasks: Background
     denied = _denied(request, auth.PERM_SEND_MAIL, f"{CHAT_INSIGHTS}/leads")
     if denied:
         return denied
-    if _lead_run_in_progress():
+    if _lead_run_in_progress() or chat_daily.lock_busy():
         return _redirect(f"{CHAT_INSIGHTS}/leads",
-                          err="The lead digest is already running. Refresh in a moment.")
+                          err="A lead run is already going. Refresh in a moment.")
     user = _current_user(request)
-    _audit(request, "lead_digest_run", None, detail="Manual run of the daily lead email.")
+    _audit(request, "lead_digest_run", None, detail="Sent the lead email by hand.")
     _leads_state.update({"running": True, "last_result": None,
                           "started_at": datetime.now(timezone.utc)})
     background_tasks.add_task(_run_lead_digest, user.get("username", ""))
     return _redirect(f"{CHAT_INSIGHTS}/leads",
-                      msg="Morning lead email started. Refresh in a few seconds to see the result.")
+                      msg="Lead email started. The page refreshes itself; the result appears "
+                          "under Lead emails.")
+
+
+# ===========================================================================
+# TEMPORARY -- lead run test panel (admins only)
+#
+# Lets an admin run the new lead schedule end to end -- fetch, find, model,
+# email -- for any window, and see the timings and the email itself, without
+# touching what the real runs rely on: a test never emails the sales team,
+# never marks a lead as emailed, and is not counted as a scheduled run.
+#
+# To remove it: delete from this banner to "END TEMPORARY" below, and the
+# {_lead_test_panel_html(request)} line and the _lead_test_in_progress() call
+# in chat_insights_leads.
+# ===========================================================================
+LEAD_TEST_PATH = CHAT_INSIGHTS + "/leads/test-run"
+_lead_test_state: dict[str, Any] = {"running": False, "started_at": None, "last_result": None}
+
+
+def _lead_test_in_progress() -> bool:
+    started = _lead_test_state.get("started_at")
+    return bool(_lead_test_state["running"] and started
+                and datetime.now(timezone.utc) - started <= LEAD_RUN_STALE_AFTER)
+
+
+def _lead_test_windows() -> list[tuple[str, str]]:
+    """(value, label) for every window a test can cover, newest first."""
+    now = datetime.now(timezone.utc)
+    options = [("now", "Since the last scheduled time, up to now")]
+    for offset, day in ((0, "Today"), (-1, "Yesterday")):
+        for slot in reversed(settings.CHAT_LEADS_SCHEDULE):
+            start, end = chat_daily.window_for_slot(slot, offset, now)
+            if end > to_au(now):
+                continue
+            options.append((f"{offset}|{slot}",
+                            f"{day}'s {au_time(end)} run: chats from {au_time(start)}"
+                            f"{' the day before' if start.date() < end.date() else ''} to {au_time(end)}"))
+    return options
+
+
+def _lead_test_panel_html(request: Request) -> str:
+    if not _can(request, auth.PERM_ADMINISTER):
+        return ""
+    email = (_current_user(request).get("email") or "").strip()
+    running = _lead_test_in_progress()
+    options = "".join(f'<option value="{html.escape(v)}">{html.escape(label)}</option>'
+                      for v, label in _lead_test_windows())
+    email_choice = (
+        f'<label><input type="radio" name="delivery" value="email"> Email it to me '
+        f'({html.escape(email)})</label>' if email else
+        '<label class="meta"><input type="radio" name="delivery" value="email" disabled> '
+        'Email it to me (add an email address to your account first)</label>')
+    if running:
+        button = ('<button class="btn-accent" type="button" disabled>'
+                  '<span class="spinner"></span> Running the test...</button>')
+    else:
+        button = (f'<button class="btn-accent" type="submit" '
+                  f'{_confirm("Run a test lead run?", body="Fetches chats and finds leads for real, but emails only you (or nobody, for a preview). Nothing is marked as emailed, and the sales team gets nothing.", ok="Run test")}>'
+                  f'&#9654; Run test</button>')
+
+    result_html = ""
+    result = _lead_test_state.get("last_result")
+    if result:
+        t = result.get("timings") or {}
+        timing_rows = "".join(
+            f'<tr><td>{label}</td><td><b>{t[key]} s</b></td></tr>'
+            for key, label in (("fetch", "Fetch from Chatbase"), ("scan", "Find leads (rules)"),
+                               ("model", "Model, leads only"), ("email", "Send email"),
+                               ("total", "Total")) if key in t)
+        counts = result.get("leads") or {}
+        facts = [("Window", result.get("day_date", "")),
+                 ("Chats fetched", result.get("fetched", 0)),
+                 ("Chats scanned", result.get("scanned", 0)),
+                 ("Leads found in those chats", counts.get("total", 0)),
+                 ("Tidied by the model this run", result.get("refined", 0)),
+                 ("Left for the next run (time budget)", result.get("deferred", 0)),
+                 ("Leads from chats in this window",
+                  result.get("reported", 0) - result.get("carried", 0)),
+                 ("Carried over from earlier (never emailed)", result.get("carried", 0)),
+                 ("Leads in this email, in total", result.get("reported", 0)),
+                 ("Subject", result.get("subject", "")),
+                 ("Email", (DIGEST_STATUS.get(result.get("email_status") or "", ("", ""))[0]
+                            + " " + (result.get("email_detail") or "")).strip()),
+                 ("Sent to", ", ".join(result.get("recipients") or []) or "nobody (preview)")]
+        fact_rows = "".join(f'<tr><td class="meta">{html.escape(k)}</td>'
+                            f'<td>{html.escape(str(v))}</td></tr>' for k, v in facts)
+        error = (f'<div class="flags">{html.escape(result["error"])}</div>'
+                 if result.get("error") else "")
+        preview = ""
+        if result.get("preview_html"):
+            preview = (f'<h3 style="margin:16px 0 8px">The email</h3>'
+                       f'<iframe sandbox title="Lead email preview" style="width:100%;height:560px;'
+                       f'border:1px solid var(--line);border-radius:8px;background:#fff" '
+                       f'srcdoc="{html.escape(result["preview_html"], quote=True)}"></iframe>')
+        result_html = f"""
+        <h3 style="margin:18px 0 8px">Last test: {html.escape(au_datetime(result.get("finished_at")))}
+            by {html.escape(result.get("by") or "")}</h3>
+        {error}
+        <div style="display:flex;gap:18px;flex-wrap:wrap">
+          <table class="grid" style="flex:2;min-width:280px">{fact_rows}</table>
+          <table class="grid" style="flex:1;min-width:200px">
+            <tr><th>Step</th><th>Time</th></tr>{timing_rows}</table>
+        </div>
+        {preview}"""
+
+    return f"""
+    <div class="panel" style="border:2px dashed var(--line)">
+      <h2 style="margin:0">Test the lead run <span class="badge planned">Temporary &middot; admins only</span></h2>
+      <p class="subtitle" style="margin:4px 0 12px">Runs the real thing -- fetch from Chatbase,
+         find leads, the model on leads only, the email -- for the window you choose, and shows
+         how long each step took. It never emails the sales team, never marks a lead as
+         emailed, and is not counted as a scheduled run.</p>
+      <form method="post" action="{LEAD_TEST_PATH}" class="person-edit wide">
+        <div style="flex:1 1 100%"><label>Window<br>
+          <select name="window">{options}</select></label></div>
+        <div><label><input type="checkbox" name="fetch" checked> Fetch new chats from Chatbase first</label></div>
+        <div style="display:flex;flex-direction:column;gap:4px">
+          <label><input type="radio" name="delivery" value="preview" checked> Show me a preview only</label>
+          {email_choice}
+        </div>
+        <div>{button}</div>
+      </form>
+      {result_html}
+    </div>"""
+
+
+def _run_lead_test(window_choice: str, fetch: bool, recipients: list[str], username: str):
+    try:
+        window = None
+        if window_choice != "now":
+            offset, slot = window_choice.split("|")
+            window = chat_daily.window_for_slot(slot, int(offset))
+        result = chat_daily.run_leads(send_email=True, fetch=fetch,
+                                      trigger=chat_db.TRIGGER_MANUAL, triggered_by=username,
+                                      window=window, test=True, test_recipients=recipients)
+    except Exception as e:
+        logger.exception("Test lead run failed")
+        result = {"error": f"The test failed: {e}"}
+    result.update(by=username, finished_at=datetime.now(timezone.utc).isoformat())
+    _lead_test_state.update(last_result=result, running=False)
+
+
+@app.post(LEAD_TEST_PATH)
+async def chat_insights_lead_test_run(request: Request, background_tasks: BackgroundTasks):
+    back = f"{CHAT_INSIGHTS}/leads"
+    denied = _denied(request, auth.PERM_ADMINISTER, back)
+    if denied:
+        return denied
+    form = await request.form()
+    window_choice = str(form.get("window") or "now")
+    if window_choice not in {v for v, _label in _lead_test_windows()}:
+        return _redirect(back, err="Choose a window from the list.")
+    email = (_current_user(request).get("email") or "").strip()
+    recipients = [email] if form.get("delivery") == "email" and email else []
+    if _lead_test_in_progress() or _lead_run_in_progress() or chat_daily.lock_busy():
+        return _redirect(back, err="A lead run is already going. Try again in a moment.")
+    _audit(request, "lead_test_run", None,
+           detail=f"Test lead run: {window_choice}, "
+                  f"{'emailed to ' + email if recipients else 'preview only'}.")
+    _lead_test_state.update(running=True, started_at=datetime.now(timezone.utc), last_result=None)
+    background_tasks.add_task(_run_lead_test, window_choice, form.get("fetch") == "on",
+                              recipients, _actor(request))
+    return _redirect(back, msg="Test run started. The page refreshes itself; results appear in "
+                               "the test panel at the bottom.")
+# ===========================================================================
+# END TEMPORARY -- lead run test panel
+# ===========================================================================
+
+
+CONTACT_SOURCE_LABELS = {
+    "form": "the contact form",
+    "bot_echo": "read back by the bot and confirmed",
+    "transcript": "typed into the chat",
+    "model": "tidied by the model",
+    "none": "not recorded",
+}
+
+
+def _lead_source_text(lead: dict) -> str:
+    parts = [CONTACT_SOURCE_LABELS.get(p, p)
+             for p in (lead.get("contact_source") or "").split("+") if p]
+    return ", ".join(parts) or "not recorded"
+
+
+@app.get(CHAT_INSIGHTS + "/leads/{conversation_id}", response_class=HTMLResponse)
+def chat_insights_lead_detail(request: Request, conversation_id: str):
+    """One lead, with everything already recorded about it -- and the note,
+    which is the one thing here a person writes."""
+    lead = chat_db.get_lead(conversation_id)
+    crumbs = [("Chat Insights", CHAT_INSIGHTS), ("Leads", f"{CHAT_INSIGHTS}/leads"), ("Lead", "")]
+    if not lead:
+        return HTMLResponse(ui.page_shell(
+            ui.empty_state("No such lead", "It may have been removed when its contact details "
+                                            "were cleared."),
+            title="Lead · Content and Automation", active_module="chat-insights",
+            user=_current_user(request), request=request, crumbs=crumbs), status_code=404)
+
+    can_work = _can(request, auth.PERM_WORK_LEADS)
+    status = lead.get("status") or "new"
+    name = (lead.get("contact_name") or "").strip()
+    heading = name or lead.get("contact_phone") or lead.get("contact_email") or "Lead"
+
+    handoff_label, handoff_note = HANDOFF_LABELS.get(
+        lead.get("handoff_state") or "", (lead.get("handoff_state") or "unknown", ""))
+    claim = (f'<div class="dry-run-note">The customer was told: &ldquo;'
+             f'{html.escape(lead.get("claim_excerpt") or "")}&rdquo;</div>'
+             if lead.get("claim_excerpt") else "")
+
+    facts = [
+        ("Came in", au_datetime(lead.get("created_at"))),
+        ("Wants", (lead.get("topic") or "") + ((" — " + lead["detail"]) if lead.get("detail") else "")),
+        ("Category", (lead.get("category") or "").replace("_", " ") or "not categorised"),
+        ("Contact details came from", _lead_source_text(lead)),
+        ("Details tidied by the model",
+         au_datetime(lead["extracted_at"]) if lead.get("extracted_at") else "no, found by the rules"),
+        ("Hand-off to sales", f"{handoff_label}. {handoff_note}".strip()),
+        ("Why we concluded that", lead.get("handoff_detail") or "--"),
+        ("Status", f"{status}" + (f", set by {lead['owner']}" if lead.get("owner") else "")
+         + (f" {au_datetime(lead['status_changed_at'])}" if lead.get("status_changed_at") else "")),
+        ("Alert emailed",
+         au_datetime(lead["alerted_at"]) if lead.get("alerted_at") else "no alert was sent"),
+        ("Included in a lead email",
+         au_datetime(lead["digested_at"]) if lead.get("digested_at") else "not yet"),
+    ]
+    fact_rows = "".join(f'<tr><td class="meta" style="white-space:nowrap">{html.escape(label)}</td>'
+                        f'<td>{html.escape(str(value))}</td></tr>' for label, value in facts)
+
+    note_text = lead.get("note") or ""
+    if can_work:
+        options = "".join(
+            f'<option value="{s}"{" selected" if s == status else ""}>{s}</option>'
+            for s in chat_db.LEAD_STATUSES)
+        work = f"""
+        <div class="panel">
+          <h2>Working this lead</h2>
+          <form method="post" action="{CHAT_INSIGHTS}/leads/{html.escape(conversation_id)}/status">
+            <input type="hidden" name="back" value="detail">
+            <div class="person-edit wide">
+              <div><label>Status<br><select name="status">{options}</select></label></div>
+              <div style="flex:1 1 100%;min-width:0"><label>Note<br>
+                <textarea name="note" rows="4" maxlength="2000" style="width:100%;resize:vertical"
+                          placeholder="What happened when you called: what they want, when to ring back, anything the next person needs."
+                          >{html.escape(note_text)}</textarea></label></div>
+            </div>
+            <button class="btn-primary" type="submit"
+                    {_confirm("Save this lead?",
+                              body="Saves the status and the note against this lead, with your name and the time. Nobody is emailed.",
+                              what=heading, ok="Save")}>Save</button>
+          </form>
+        </div>"""
+    else:
+        work = (f'<div class="panel"><h2>Note</h2><div class="meta" style="white-space:pre-wrap">'
+                f'{html.escape(note_text) or "No note yet."}</div></div>')
+
+    body = f"""
+    <div class="page-head">
+      <div>
+        <h1>{html.escape(heading)}</h1>
+        <p class="subtitle">{html.escape(LEAD_TYPE_LABELS.get(lead.get("lead_type"), lead.get("lead_type") or ""))}
+           &middot; <span class="badge status-{html.escape(status)}">{html.escape(status)}</span></p>
+      </div>
+      <a class="btn-ghost" style="padding:8px 14px;text-decoration:none;border-radius:8px"
+         href="{CHAT_INSIGHTS}/conversation/{html.escape(conversation_id)}">Read the chat</a>
+    </div>
+    {claim}
+    <div class="panel">
+      <h2>Contact</h2>
+      {_lead_contact_html(lead)}
+    </div>
+    {work}
+    <div class="panel">
+      <h2>What we know</h2>
+      <table class="grid">{fact_rows}</table>
+    </div>
+    """
+    return ui.page_shell(body, title=f"{heading} · Content and Automation",
+                         active_module="chat-insights", user=_current_user(request),
+                         request=request, crumbs=crumbs)
 
 
 @app.post(CHAT_INSIGHTS + "/leads/{conversation_id}/status")
 def chat_insights_lead_status(request: Request, conversation_id: str,
-                               status: str = Form(...)):
+                               status: str = Form(...), note: str | None = Form(default=None),
+                               back: str = Form(default="")):
+    """Sets the status, and the note when one came with it.
+
+    `note` is only ever sent by the detail page; the list's inline dropdown
+    leaves it out, and set_lead_status treats None as "leave the note alone".
+    """
+    destination = (f"{CHAT_INSIGHTS}/leads/{conversation_id}" if back == "detail"
+                   else f"{CHAT_INSIGHTS}/leads")
+    denied = _denied(request, auth.PERM_WORK_LEADS, destination)
+    if denied:
+        return denied
+    before = chat_db.get_lead(conversation_id) or {}
+    if note is not None:
+        note = note.strip()[:2000]
     try:
         chat_db.set_lead_status(conversation_id, status,
-                                 owner=_current_user(request).get("username", ""))
+                                 owner=_current_user(request).get("username", ""), note=note)
     except ValueError as e:
-        return _redirect(f"{CHAT_INSIGHTS}/leads", err=str(e))
-    return _redirect(f"{CHAT_INSIGHTS}/leads", msg=f"Lead marked {status}.")
+        return _redirect(destination, err=str(e))
+    if note is not None and note != (before.get("note") or ""):
+        _audit(request, "lead_note", None,
+               detail=f"Note on the lead from {before.get('contact_name') or conversation_id}: "
+                      f"{'cleared' if not note else note[:200]}")
+    return _redirect(destination, msg=f"Lead marked {status}."
+                                      + (" Note saved." if note else ""))
 
 
 @app.post(CHAT_INSIGHTS + "/run/{run_id}/email")
@@ -2981,7 +3778,7 @@ def settings_jobs(request: Request, log: str = "", lines: int = job_logs.DEFAULT
         if e["exists"]:
             size = f'{e["size"]/1024:.1f} KB' if e["size"] >= 1024 else f'{e["size"]} bytes'
             state = f'<span class="badge live">written</span>'
-            when = e["modified"].strftime("%Y-%m-%d %H:%M UTC")
+            when = au_datetime(e["modified"])
         else:
             size, when = "--", "--"
             state = '<span class="badge planned">never written</span>'
@@ -3030,6 +3827,7 @@ def settings_jobs(request: Request, log: str = "", lines: int = job_logs.DEFAULT
       <p class="subtitle">A record of what the automatic overnight jobs did. If a job has
          nothing here at all, it never started.</p></div>
     </div>
+    {_task_status_panel(lines)}
     <div class="panel">
       <h2>Logs</h2>
       <table class="grid">
@@ -3042,6 +3840,61 @@ def settings_jobs(request: Request, log: str = "", lines: int = job_logs.DEFAULT
     return ui.page_shell(body, title="Job history · Content and Automation",
                           active_module="settings", user=user, request=request,
                           crumbs=[("Administration", ui.SETTINGS_ROOT), ("Job history", "")])
+
+
+def _task_status_panel(lines: int) -> str:
+    """What Windows says about each job: schedule, last run, result, next run.
+
+    Answers "did it run?" -- which the log list underneath cannot, because a
+    task that never started writes nothing at all.
+    """
+    state = task_status.tasks()
+    rows = ""
+    for task in state["rows"]:
+        log_link = ""
+        if task["log_key"] in job_logs.CATALOGUE:
+            log_link = (f'<a class="btn-ghost" style="padding:4px 10px;text-decoration:none;'
+                        f'border-radius:8px" href="/settings/jobs?log={task["log_key"]}'
+                        f'&lines={lines}">Log</a>')
+        if task["known"]:
+            detail = (f'<div class="meta">{html.escape(task["schedule"])}'
+                      f'{" &middot; runs as " + html.escape(task["run_as"]) if task["run_as"] else ""}'
+                      f'</div>')
+            when = (f'{html.escape(task["last_run"]) or "--"}'
+                    f'<div class="meta">next {html.escape(task["next_run"]) or "not scheduled"}</div>')
+        else:
+            detail = ('<div class="meta">Registered by another account, or not registered at all. '
+                      'Its log below says whether it is running.</div>')
+            when = '<span class="meta">--</span>'
+        rows += f"""
+        <tr>
+          <td><b>{html.escape(task["name"])}</b>
+              <div class="meta">{html.escape(task["purpose"])}</div>{detail}</td>
+          <td><span class="badge {task["badge"]}">{html.escape(task["result"])}</span>
+              {f'<div class="meta">{html.escape(task["state"])}</div>' if task["state"] else ''}</td>
+          <td class="meta">{when}</td>
+          <td>{log_link}</td>
+        </tr>"""
+
+    notes = ""
+    if state["error"]:
+        notes += f'<div class="flags">{html.escape(state["error"])}</div>'
+    if state["missing"]:
+        notes += ('<div class="meta">Some tasks are not visible to the account this dashboard '
+                  'runs as. That is a permissions difference, not proof they are missing -- '
+                  'check the log underneath, which is written by the job itself.</div>')
+    return f"""
+    <div class="panel">
+      <h2>Scheduled jobs</h2>
+      <p class="subtitle" style="margin:4px 0 10px">What Windows Task Scheduler says. Read-only:
+         starting or changing a task is still done on the server. Checked
+         {html.escape(au_time(state["checked_at"]))}, and re-read at most once a minute.</p>
+      {notes}
+      <table class="grid">
+        <tr><th>Task</th><th>Last result</th><th>Last run</th><th></th></tr>
+        {rows}
+      </table>
+    </div>"""
 
 
 ACTION_LABELS = {
@@ -3059,10 +3912,28 @@ ACTION_LABELS = {
     "images_added": "Attached images",
     "images_removed": "Removed an image",
     "images_reclaimed": "Reclaimed staged images",
+    "descriptions_exported": "Exported descriptions",
+    "bulk_published": "Sent descriptions to Odoo in bulk",
+    "assistant_catalogue": "Refreshed the assistant's product list",
+    "report_downloaded": "Downloaded a report as a PDF",
+    "permission_denied": "Refused -- no permission",
+    "invite_sent": "Sent an invitation",
+    "reset_link_sent": "Sent a reset link",
+    "user_updated": "Edited a person",
+    "user_deleted": "Deleted a person",
+    "own_password_changed": "Changed their own password",
+    "site_monitor_check": "Checked the site by hand",
+    "site_monitor_settings": "Changed the Site health settings",
+    "site_monitor_test_email": "Sent a Site health test email",
+    "lead_note": "Wrote a note on a lead",
+    "lead_digest_run": "Sent the lead email by hand",
+    "lead_test_run": "Ran a test lead run",
 }
 ACTION_BADGES = {
     "approved": "confidence-high", "published": "live",
     "rejected": "confidence-low", "publish_failed": "confidence-low",
+    # The one line in the trail that is about security rather than work.
+    "permission_denied": "planned", "user_deleted": "confidence-low",
 }
 
 
@@ -3114,7 +3985,7 @@ def settings_audit(request: Request, actor: str = "", action: str = "", page: in
 
     rows = ""
     for e in entries:
-        when = (e.get("at") or "")[:19].replace("T", " ")
+        when = au_datetime(e.get("at"))
         badge_cls = ACTION_BADGES.get(e.get("action"), "planned")
         target = html.escape(e.get("title") or "")
         if e.get("row_id"):
@@ -3122,7 +3993,7 @@ def settings_audit(request: Request, actor: str = "", action: str = "", page: in
                        if target else f'#{e["row_id"]}')
         rows += f"""
         <tr>
-          <td class="meta" style="white-space:nowrap">{html.escape(when)} UTC</td>
+          <td class="meta" style="white-space:nowrap">{html.escape(when)}</td>
           <td><b>{html.escape(e.get("actor") or "")}</b></td>
           <td><span class="badge {badge_cls}">
               {html.escape(ACTION_LABELS.get(e.get("action"), e.get("action") or ""))}</span></td>
@@ -3212,7 +4083,7 @@ def settings_images(request: Request):
                       f'<div class="meta">SKU {html.escape(str(img["product_id"]))} '
                       f'&middot; queue row {img["row_id"]}</div></td>'
                       f'<td class="meta">'
-                      f'{html.escape(str(img.get("published_at") or "")[:19].replace("T", " "))}</td>'
+                      f'{html.escape(au_datetime(img.get("published_at"), fallback=""))}</td>'
                       f'<td class="meta">{html.escape(img.get("publish_detail") or "")}</td></tr>')
         problems = f"""
         <div class="panel">
@@ -3336,11 +4207,11 @@ def settings_users(request: Request):
         else:
             state = (f'<span class="badge live">Active</span>'
                       f'<span class="meta" style="margin-left:8px">last in '
-                      f'{html.escape(str(signed_in))[:16].replace("T", " ")}</span>')
+                      f'{html.escape(au_datetime(signed_in))}</span>')
 
         role_options = "".join(
             f'<option value="{r}"{" selected" if r == u["role"] else ""}>'
-            f'{"Admin" if r == auth.ROLE_ADMIN else "Reviewer"}</option>'
+            f'{html.escape(auth.role_label(r))}</option>'
             for r in auth.ROLES)
         role_field = (f'<select name="role" disabled title="You cannot change your own role">'
                        f'{role_options}</select>' if is_self else
@@ -3447,6 +4318,9 @@ def settings_users(request: Request):
       <p class="meta" style="margin:-4px 0 12px">Give them an email address and they get an
          invitation to choose their own password. Type a password instead only if they have
          no email address.</p>
+      <ul class="meta" style="margin:0 0 12px;padding-left:18px">{"".join(
+          f'<li><b>{html.escape(auth.role_label(r))}</b>: {html.escape(auth.ROLE_DESCRIPTIONS[r])}</li>'
+          for r in (auth.ROLE_REVIEWER, auth.ROLE_SALES, auth.ROLE_ADMIN))}</ul>
       <form method="post" action="/settings/users/create" class="person-edit wide">
         <div><label>Username<br><input type="text" name="username" required
              placeholder="jsmith" autocomplete="off"></label></div>
@@ -3455,9 +4329,10 @@ def settings_users(request: Request):
         <div><label>Email address<br><input type="email" name="email"
              placeholder="jane@bcsands.com.au"></label></div>
         <div><label>Role<br>
-          <select name="role">
-            <option value="reviewer">Reviewer</option>
-            <option value="admin">Admin</option>
+          <select name="role">{"".join(
+              f'<option value="{r}"{" selected" if r == auth.ROLE_REVIEWER else ""}>'
+              f'{html.escape(auth.role_label(r))}</option>'
+              for r in (auth.ROLE_REVIEWER, auth.ROLE_SALES, auth.ROLE_ADMIN))}
           </select></label></div>
         <div><label>Password <span class="meta">(optional)</span><br>
           <input type="password" name="password" minlength="8"
@@ -3692,7 +4567,7 @@ def change_own_password(request: Request, current_password: str = Form(...),
 # ---------------------------------------------------------------------------
 # Site health
 #
-# Reviewers and admins both see the page. Changing settings, running a check
+# Admins, reviewers and sales all see the page. Changing settings, running a check
 # and sending a test email are admin-only, like every other job and mail
 # control on the dashboard.
 # ---------------------------------------------------------------------------
@@ -3715,6 +4590,8 @@ MONITOR_FAMILIES = {"down": "Down", "error": "Problem", "slow": "Slow",
                     "blocked": "Blocked by Cloudflare"}
 MONITOR_ROUTES = {"direct": "Direct to the server",
                   "public": "Through Cloudflare, as customers reach it"}
+MONITOR_SESSION_MODES = {"query": "In the address and a cookie",
+                         "cookie": "In a cookie only"}
 
 
 def _monitor_card_stats() -> str:
@@ -3768,13 +4645,16 @@ def _uptime_text(value) -> str:
 
 def _monitor_settings_form(current: dict) -> str:
     targets = list(current["targets"]) + [{"key": "", "label": "", "url": "", "route": "direct",
-                                           "session_param": "", "must_contain": [],
-                                           "enabled": False}]
+                                           "session_param": "", "session_mode": "query",
+                                           "must_contain": [], "enabled": False}]
     rows = ""
     for i, t in enumerate(targets):
         options = "".join(
             f'<option value="{r}"{" selected" if r == t.get("route") else ""}>{html.escape(label)}</option>'
             for r, label in MONITOR_ROUTES.items())
+        mode_options = "".join(
+            f'<option value="{m}"{" selected" if m == (t.get("session_mode") or "query") else ""}>'
+            f'{html.escape(label)}</option>' for m, label in MONITOR_SESSION_MODES.items())
         placeholder = "" if t.get("label") else "Add a page"
         rows += f"""
           <tr>
@@ -3789,6 +4669,7 @@ def _monitor_settings_form(current: dict) -> str:
             <td><textarea name="t{i}_contains" rows="2" placeholder="One per line">{html.escape(chr(10).join(t.get('must_contain') or []))}</textarea></td>
             <td><input type="text" name="t{i}_session" maxlength="32" style="width:90px"
                        value="{html.escape(t.get('session_param', ''), quote=True)}"></td>
+            <td><select name="t{i}_mode">{mode_options}</select></td>
           </tr>"""
     return f"""
     <div class="panel">
@@ -3823,9 +4704,11 @@ def _monitor_settings_form(current: dict) -> str:
         <p class="meta" style="margin:-4px 0 10px">Each page switched on is one request every five
            minutes. Keep the list short. "Session" is the shop's session parameter (zenid); the
            monitor keeps one session per route and reuses it, because a new one is slow for the
-           shop server.</p>
+           shop server. Sending it in a cookie only is what lets the Cloudflare check reach a shop
+           page: the rules there challenge any address containing "zenid=", but do not read cookies.</p>
         <table class="grid">
-          <tr><th>On</th><th>Name</th><th>Address</th><th>Reached</th><th>Must contain</th><th>Session</th></tr>
+          <tr><th>On</th><th>Name</th><th>Address</th><th>Reached</th><th>Must contain</th>
+              <th>Session</th><th>Session sent</th></tr>
           {rows}
         </table>
         <div style="margin-top:14px">
@@ -3840,7 +4723,7 @@ def _monitor_settings_form(current: dict) -> str:
 def site_health(request: Request):
     user = _current_user(request)
     crumbs = [("Site health", "")]
-    if not _can(request, auth.PERM_REVIEW):
+    if not _can(request, auth.PERM_VIEW_SITE_HEALTH):
         return HTMLResponse(ui.page_shell(
             ui.empty_state("No access", "Your account cannot see this page."),
             title="Site health \u00b7 Content and Automation", active_module="site-health",
@@ -3998,6 +4881,7 @@ async def site_health_settings(request: Request):
                 "url": form.get(f"t{i}_url", ""), "route": form.get(f"t{i}_route", "direct"),
                 "must_contain": form.get(f"t{i}_contains", ""),
                 "session_param": form.get(f"t{i}_session", ""),
+                "session_mode": form.get(f"t{i}_mode", "query"),
                 "enabled": form.get(f"t{i}_enabled") in ("on", "true", "1")}
                for i in range(count)]
     values = {name: form.get(name, "") for name in (
@@ -4052,6 +4936,415 @@ def site_health_test_email(request: Request):
         return _redirect(MONITOR_PATH,
                          msg=f"Test email sent to {', '.join(current['recipients'])}.")
     return _redirect(MONITOR_PATH, err=f"The test email did not send: {outcome.get('detail', '')}")
+
+
+# ---------------------------------------------------------------------------
+# The staff assistant
+#
+# Admin-only while we find out whether it is any good. Every answer is stored
+# with the products it was built from and can be marked good or bad, because
+# "does this help?" has to be answerable from records rather than impressions.
+# ---------------------------------------------------------------------------
+ASSISTANT_PATH = "/assistant"
+
+
+SUGGESTIONS = ("What do we sell for laying pavers?",
+               "What is vegie organic mix used for?",
+               "Which mulch suits a garden bed?")
+
+
+def _assistant_source_chips(sources: list[dict]) -> str:
+    """The products an answer was built from. Mirrored in the page's JavaScript
+    (sourceChips) so a live answer and a reloaded one look identical."""
+    if not sources:
+        return ('<div class="bsources"><span class="meta">Not based on any product in the '
+                'catalogue.</span></div>')
+    chips = ""
+    for source in sources:
+        label = html.escape(f'{source["title"]} ({source["sku"]})')
+        if source.get("kind") == "description" and source.get("row_id"):
+            chips += (f'<a class="chat-suggest" style="text-decoration:none" '
+                      f'href="{CONTENT_AGENT}/history?q={source["row_id"]}">{label}</a>')
+        else:
+            chips += f'<span class="badge planned" style="font-weight:500">{label}</span>'
+    described = sum(1 for s in sources if s.get("kind") == "description")
+    return (f'<div class="bsources"><span class="meta">From {described} description(s), '
+            f'{len(sources) - described} product name(s):</span>{chips}</div>')
+
+
+def _assistant_rate_html(message_id: int, rating: str) -> str:
+    buttons = "".join(
+        f'<button class="{cls}" type="submit" name="rating" value="{value}" '
+        f'form="rate-{message_id}" data-rate="{value}" data-no-confirm="judging an answer '
+        f'changes nothing" aria-pressed="{"true" if rating == value else "false"}">{label}</button>'
+        for value, label, cls in (("good", "&#128077; Useful", "approve"),
+                                  ("bad", "&#128078; Wrong", "reject")))
+    return (f'<div class="brate" data-rate-for="{message_id}">{buttons}'
+            f'<form method="post" action="{ASSISTANT_PATH}/rate/{message_id}" '
+            f'id="rate-{message_id}" style="display:none"></form></div>')
+
+
+def _assistant_bubble_html(message: dict) -> str:
+    when = html.escape(au_time(message.get("created_at")))
+    if message["role"] == "person":
+        return (f'<div class="chat-row me"><div class="chat-avatar">You</div>'
+                f'<div class="bubble">{html.escape(message["text"])}'
+                f'<span class="bmeta">{when}</span></div></div>')
+    warn = (f'<div class="bwarn">{html.escape(message["flagged"])}</div>'
+            if message.get("flagged") else "")
+    model = html.escape(message.get("model") or "")
+    seconds = (message.get("ms") or 0) / 1000
+    judged = ""
+    if message.get("rating") and message.get("rated_by"):
+        judged = (f' &middot; marked {html.escape(message["rating"])} by '
+                  f'{html.escape(message["rated_by"])}')
+    return (f'<div class="chat-row bot"><div class="chat-avatar">BC</div>'
+            f'<div class="bubble">{warn}{html.escape(message["text"])}'
+            f'{_assistant_source_chips(message.get("sources") or [])}'
+            f'{_assistant_rate_html(message["id"], message.get("rating") or "")}'
+            f'<span class="bmeta">{model} &middot; {seconds:.1f} s &middot; {when}{judged}</span>'
+            f'</div></div>')
+
+
+def _assistant_thread_html(conversation_id: int | None) -> str:
+    messages = assistant_store.messages(conversation_id) if conversation_id else []
+    if not messages:
+        chips = "".join(f'<button type="button" class="chat-suggest" data-ask="{html.escape(q, quote=True)}">'
+                        f'{html.escape(q)}</button>' for q in SUGGESTIONS)
+        return ('<div class="chat-empty" id="chat-empty"><b>Ask about our products</b>'
+                'Answers are built from the approved descriptions and the product list, and take '
+                f'a few seconds on this server.<div style="margin-top:10px">{chips}</div></div>')
+    return "".join(_assistant_bubble_html(m) for m in messages)
+
+
+# The page posts the question with fetch and puts the answer straight into the
+# thread. Without it the browser would sit on a blank page for ten to
+# twenty-five seconds per question, which reads as broken -- and the form still
+# works on its own if this never runs.
+ASSISTANT_JS = r"""
+(function () {
+  const thread = document.getElementById('chat-thread');
+  const form = document.getElementById('composer');
+  const box = document.getElementById('question');
+  const idField = document.getElementById('conversation-id');
+  const askBtn = document.getElementById('ask-btn');
+  const note = document.getElementById('ask-note');
+  if (!thread || !form) return;
+
+  const esc = (s) => { const d = document.createElement('div'); d.textContent = s == null ? '' : s; return d.innerHTML; };
+  const scroll = () => { thread.scrollTop = thread.scrollHeight; };
+
+  function sourceChips(sources) {
+    if (!sources || !sources.length) {
+      return '<div class="bsources"><span class="meta">Not based on any product in the catalogue.</span></div>';
+    }
+    const described = sources.filter(s => s.kind === 'description').length;
+    const chips = sources.map(s => {
+      const label = esc(s.title + ' (' + s.sku + ')');
+      return s.url ? '<a class="chat-suggest" style="text-decoration:none" href="' + s.url + '">' + label + '</a>'
+                   : '<span class="badge planned" style="font-weight:500">' + label + '</span>';
+    }).join('');
+    return '<div class="bsources"><span class="meta">From ' + described + ' description(s), ' +
+           (sources.length - described) + ' product name(s):</span>' + chips + '</div>';
+  }
+
+  function bubble(role, inner) {
+    const row = document.createElement('div');
+    row.className = 'chat-row ' + (role === 'me' ? 'me' : 'bot');
+    row.innerHTML = '<div class="chat-avatar">' + (role === 'me' ? 'You' : 'BC') + '</div>' +
+                    '<div class="bubble">' + inner + '</div>';
+    const empty = document.getElementById('chat-empty');
+    if (empty) empty.remove();
+    thread.appendChild(row);
+    scroll();
+    return row;
+  }
+
+  function rateBlock(id) {
+    return '<div class="brate" data-rate-for="' + id + '">' +
+           '<button class="approve" data-rate="good" aria-pressed="false">&#128077; Useful</button>' +
+           '<button class="reject" data-rate="bad" aria-pressed="false">&#128078; Wrong</button></div>';
+  }
+
+  async function ask(question) {
+    const waiting = bubble('bot',
+      '<span class="typing"><i></i><i></i><i></i></span> <span class="meta" data-timer>thinking...</span>');
+    const started = Date.now();
+    const timer = setInterval(() => {
+      const el = waiting.querySelector('[data-timer]');
+      if (el) el.textContent = 'thinking... ' + Math.round((Date.now() - started) / 1000) + 's';
+    }, 1000);
+    try {
+      const res = await fetch('/api/assistant/ask', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ question: question, model: document.getElementById('model').value,
+                               conversation_id: Number(idField.value || 0) })
+      });
+      const data = await res.json();
+      clearInterval(timer);
+      if (!res.ok || data.error) {
+        waiting.querySelector('.bubble').innerHTML =
+          '<div class="bwarn">' + esc(data.error || 'The assistant could not answer.') + '</div>';
+        return;
+      }
+      idField.value = data.conversation_id;
+      const warn = data.flagged ? '<div class="bwarn">' + esc(data.flagged) + '</div>' : '';
+      waiting.querySelector('.bubble').innerHTML =
+        warn + esc(data.answer) + sourceChips(data.sources) + rateBlock(data.message_id) +
+        '<span class="bmeta">' + esc(data.model) + ' &middot; ' + (data.ms / 1000).toFixed(1) + ' s</span>';
+      scroll();
+      if (history.replaceState) history.replaceState({}, '', '/assistant?c=' + data.conversation_id);
+    } catch (e) {
+      clearInterval(timer);
+      waiting.querySelector('.bubble').innerHTML =
+        '<div class="bwarn">Could not reach the dashboard: ' + esc(e.message) + '</div>';
+    } finally {
+      askBtn.disabled = false;
+      askBtn.textContent = 'Ask';
+      if (note) note.textContent = 'Answers take 10-25 seconds on this server.';
+      box.focus();
+    }
+  }
+
+  form.addEventListener('submit', (e) => {
+    const question = (box.value || '').trim();
+    if (!question) return;
+    e.preventDefault();
+    bubble('me', esc(question));
+    box.value = '';
+    askBtn.disabled = true;
+    askBtn.textContent = 'Asking...';
+    if (note) note.textContent = 'Reading the product notes and asking the model.';
+    ask(question);
+  });
+
+  box.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); form.requestSubmit(); }
+  });
+
+  document.addEventListener('click', async (e) => {
+    const suggest = e.target.closest('[data-ask]');
+    if (suggest) { box.value = suggest.dataset.ask; form.requestSubmit(); return; }
+    const rate = e.target.closest('[data-rate]');
+    if (!rate) return;
+    const holder = rate.closest('[data-rate-for]');
+    if (!holder) return;
+    e.preventDefault();
+    const res = await fetch('/api/assistant/rate', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ message_id: Number(holder.dataset.rateFor), rating: rate.dataset.rate })
+    });
+    if (res.ok) {
+      holder.querySelectorAll('[data-rate]').forEach(b =>
+        b.setAttribute('aria-pressed', b === rate ? 'true' : 'false'));
+    }
+  });
+
+  scroll();
+  box.focus();
+})();
+"""
+
+
+@app.get(ASSISTANT_PATH, response_class=HTMLResponse)
+def assistant_page(request: Request, c: int = 0):
+    state = assistant_catalogue.status()
+    scores = assistant_store.ratings()
+    models = assistant_chat.available_models()
+    conversation_id = c or 0
+
+    if state["never"]:
+        catalogue_note = ('<b>The product list has not been read from Odoo yet.</b> Until it is, '
+                          'the assistant only knows the approved descriptions.')
+    elif state["stale"]:
+        catalogue_note = (f'<b>The product list is from '
+                          f'{html.escape(au_datetime(state["refreshed_at"]))}</b> and may be out of '
+                          f'date. {state["count"]} products.')
+    else:
+        catalogue_note = (f'{state["count"]} products, read from Odoo '
+                          f'{html.escape(au_datetime(state["refreshed_at"]))}.')
+
+    options = "".join(
+        f'<option value="{html.escape(name, quote=True)}"'
+        f'{" selected" if name == settings.ASSISTANT_MODEL else ""}>{html.escape(label)}</option>'
+        for name, label in models.items())
+    judged = scores["good"] + scores["bad"]
+    score_line = ("No answers judged yet." if not judged else
+                  f'{scores["good"]} of {judged} answers marked useful'
+                  + (f', {scores["flagged"]} needed a second look' if scores["flagged"] else ""))
+
+    recent = "".join(
+        f'<tr><td><a href="{ASSISTANT_PATH}?c={row["id"]}">'
+        f'{html.escape((row.get("first_question") or "(no question)")[:80])}</a></td>'
+        f'<td class="meta">{row.get("questions", 0)}</td>'
+        f'<td class="meta">{html.escape(au_datetime(row.get("started_at")))}</td>'
+        f'<td class="meta">{html.escape(row.get("actor") or "")}</td></tr>'
+        for row in assistant_store.recent_conversations(10))
+
+    body = f"""
+    <div class="page-head">
+      <div>
+        <h1>Assistant</h1>
+        <p class="subtitle">Ask about our products. Answers are built from the descriptions we
+           have approved and the product list from Odoo -- not from what the model remembers,
+           which is wrong often enough to matter. It cannot tell you prices, stock or delivery
+           costs.</p>
+      </div>
+    </div>
+    {_restart_notice(request)}
+    <div class="fetch-bar" style="flex-wrap:wrap">
+      <form method="post" action="{ASSISTANT_PATH}/refresh-catalogue" style="margin:0">
+        <button class="btn-ghost" type="submit"
+                {_confirm("Read the product list from Odoo again?",
+                          body="Reads every active product's name and code from Odoo, which takes "
+                               "about 10 seconds, and replaces the copy held here. Nothing is "
+                               "written to Odoo.", ok="Refresh it")}>&#8635; Refresh product list</button>
+      </form>
+      <span class="meta" style="flex:1 1 300px">{catalogue_note} {html.escape(score_line)}</span>
+      <form method="post" action="{ASSISTANT_PATH}/new" style="margin:0">
+        <button class="btn-ghost" type="submit"
+                data-no-confirm="starting a new thread changes nothing">Start again</button>
+      </form>
+    </div>
+
+    <div class="panel" style="padding-bottom:10px">
+      <div class="chat-thread" id="chat-thread">{_assistant_thread_html(conversation_id)}</div>
+      <div class="composer">
+        <form method="post" action="{ASSISTANT_PATH}/ask" id="composer">
+          <input type="hidden" name="conversation_id" id="conversation-id" value="{conversation_id}">
+          <textarea name="question" id="question" rows="2" required
+                    placeholder="Ask about a product -- Enter to send, Shift+Enter for a new line"></textarea>
+          <div class="crow">
+            <label class="meta">Model <select name="model" id="model">{options}</select></label>
+            <button class="btn-primary" type="submit" id="ask-btn"
+                    data-no-confirm="asking a question changes nothing">Ask</button>
+            <span class="meta" id="ask-note">Answers take 10-25 seconds on this server.</span>
+          </div>
+        </form>
+      </div>
+    </div>
+
+    <div class="panel">
+      <h2>Recent questions</h2>
+      <table class="grid">
+        <tr><th>First question</th><th>Asked</th><th>Started</th><th>By</th></tr>
+        {recent or '<tr><td colspan="4" class="meta">Nothing asked yet.</td></tr>'}
+      </table>
+    </div>
+    <script>{ASSISTANT_JS}</script>
+    """
+    return ui.page_shell(body, title="Assistant · Content and Automation",
+                         active_module="assistant", user=_current_user(request), request=request,
+                         crumbs=[("Assistant", "")])
+
+
+def _assistant_answer(actor: str, question: str, model: str, conversation_id: int) -> dict:
+    """One question through the assistant, stored. Shared by the page's
+    JavaScript and the plain form it falls back to, so both behave the same."""
+    question = " ".join((question or "").split())[:1000]
+    if not question:
+        return {"error": "Type a question first.", "conversation_id": conversation_id}
+    models = assistant_chat.available_models()
+    if model not in models:
+        model = (settings.ASSISTANT_MODEL if settings.ASSISTANT_MODEL in models
+                 else next(iter(models)))
+
+    history = assistant_store.messages(conversation_id) if conversation_id else []
+    if not conversation_id:
+        conversation_id = assistant_store.start_conversation(actor, model, question)
+    assistant_store.add_message(conversation_id, "person", question)
+
+    result = assistant_chat.ask(question, model=model, history=history)
+    if result["error"]:
+        assistant_store.add_message(conversation_id, "assistant", f"(no answer) {result['error']}",
+                                    model=model, ms=result["ms"], sources=result["sources"],
+                                    flagged="The model did not answer.")
+        return {"error": result["error"], "conversation_id": conversation_id}
+
+    message_id = assistant_store.add_message(conversation_id, "assistant", result["answer"],
+                                             model=model, ms=result["ms"],
+                                             sources=result["sources"], flagged=result["flagged"])
+    sources = [{**s, "url": (f"{CONTENT_AGENT}/history?q={s['row_id']}"
+                             if s.get("kind") == "description" and s.get("row_id") else "")}
+               for s in result["sources"]]
+    return {"error": "", "conversation_id": conversation_id, "message_id": message_id,
+            "answer": result["answer"], "flagged": result["flagged"], "ms": result["ms"],
+            "model": model, "sources": sources}
+
+
+@app.post(ASSISTANT_PATH + "/ask")
+def assistant_ask(request: Request, question: str = Form(...),
+                   model: str = Form(default=""), conversation_id: int = Form(default=0)):
+    """The no-JavaScript path: the browser waits for the answer and the whole
+    page comes back with it."""
+    denied = _denied(request, auth.PERM_ADMINISTER, ASSISTANT_PATH)
+    if denied:
+        return denied
+    result = _assistant_answer(_actor(request), question, model, conversation_id)
+    back = (f"{ASSISTANT_PATH}?c={result['conversation_id']}" if result.get("conversation_id")
+            else ASSISTANT_PATH)
+    if result["error"]:
+        return _redirect(back, err=result["error"])
+    return _redirect(back)
+
+
+@app.post("/api/assistant/ask")
+async def api_assistant_ask(request: Request):
+    """What the page posts to while you watch the thread."""
+    payload = await request.json()
+    result = _assistant_answer(_actor(request), str(payload.get("question") or ""),
+                               str(payload.get("model") or ""),
+                               int(payload.get("conversation_id") or 0))
+    return JSONResponse(result, status_code=200 if not result["error"] else 502)
+
+
+@app.post("/api/assistant/rate")
+async def api_assistant_rate(request: Request):
+    payload = await request.json()
+    try:
+        rated = assistant_store.rate_message(int(payload.get("message_id") or 0),
+                                             str(payload.get("rating") or ""), _actor(request))
+    except (ValueError, TypeError):
+        return JSONResponse({"error": "That is not a rating."}, status_code=400)
+    if not rated:
+        return JSONResponse({"error": "That answer is no longer here."}, status_code=404)
+    return JSONResponse({"ok": True})
+
+
+@app.post(ASSISTANT_PATH + "/new")
+def assistant_new(request: Request):
+    denied = _denied(request, auth.PERM_ADMINISTER, ASSISTANT_PATH)
+    if denied:
+        return denied
+    return _redirect(ASSISTANT_PATH)
+
+
+@app.post(ASSISTANT_PATH + "/rate/{message_id}")
+def assistant_rate(request: Request, message_id: int, rating: str = Form(...)):
+    denied = _denied(request, auth.PERM_ADMINISTER, ASSISTANT_PATH)
+    if denied:
+        return denied
+    thread = assistant_store.conversation_of(message_id)
+    try:
+        rated = assistant_store.rate_message(message_id, rating, _actor(request))
+    except ValueError:
+        return _redirect(ASSISTANT_PATH, err="That is not a rating.")
+    if not rated:
+        return _redirect(ASSISTANT_PATH, err="That answer is no longer here.")
+    back = f"{ASSISTANT_PATH}?c={thread}" if thread else ASSISTANT_PATH
+    return _redirect(back, msg="Thanks -- that is recorded.")
+
+
+@app.post(ASSISTANT_PATH + "/refresh-catalogue")
+def assistant_refresh_catalogue(request: Request):
+    denied = _denied(request, auth.PERM_ADMINISTER, ASSISTANT_PATH)
+    if denied:
+        return denied
+    result = assistant_catalogue.refresh()
+    _audit(request, "assistant_catalogue", detail=result["detail"])
+    if not result["ok"]:
+        return _redirect(ASSISTANT_PATH, err=result["detail"])
+    return _redirect(ASSISTANT_PATH, msg=result["detail"])
 
 
 @app.get("/api/status")

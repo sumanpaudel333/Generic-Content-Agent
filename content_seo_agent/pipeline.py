@@ -22,7 +22,6 @@ import logging
 import os
 
 from config import settings
-from config.settings import STANDARDS_WHITELIST
 from content_seo_agent import small_model_client, claude_client, confidence, review_queue, title_parser
 from content_seo_agent.constants import TaskType, Source
 
@@ -144,7 +143,10 @@ def process_drafting(product_id, title: str) -> dict:
     one before it came back low confidence or tripped the safety filter."""
     # Deterministic, code-only extraction -- never trust the model for these.
     title_facts = title_parser.parse_title(title)
-    verified_claims = [STANDARDS_WHITELIST[product_id]] if product_id in STANDARDS_WHITELIST else []
+    # Read off the module rather than bound at import: every other consumer
+    # does, which is what would let settings be re-read without a restart.
+    whitelist = settings.STANDARDS_WHITELIST
+    verified_claims = [whitelist[product_id]] if product_id in whitelist else []
 
     def score(result):
         return confidence.score_draft(result, title, verified_claims)
@@ -249,7 +251,10 @@ def regenerate_draft_for_row(row_id: int, model: str = "") -> dict | None:
     rejection_note = (row.get("reviewer_note") or row.get("last_rejection_note") or "").strip()
 
     title_facts = title_parser.parse_title(title)
-    verified_claims = [STANDARDS_WHITELIST[product_id]] if product_id in STANDARDS_WHITELIST else []
+    # Read off the module rather than bound at import: every other consumer
+    # does, which is what would let settings be re-read without a restart.
+    whitelist = settings.STANDARDS_WHITELIST
+    verified_claims = [whitelist[product_id]] if product_id in whitelist else []
     context = f"A reviewer rejected the previous draft for this reason: {rejection_note}" if rejection_note else ""
 
     def score(result):

@@ -36,6 +36,7 @@ MODULES: list[dict[str, Any]] = [
         "path": "/content-agent",
         "status": "live",
         "icon": "doc",
+        "permission": "view_content",
         "blurb": "Writes product descriptions for you and puts each one in a queue "
                   "to be checked. Nothing reaches the website until someone here "
                   "approves it.",
@@ -46,6 +47,7 @@ MODULES: list[dict[str, Any]] = [
         "path": "/chat-insights",
         "status": "live",
         "icon": "chat",
+        "permission": "view_chat",
         "blurb": "Reads the week's website chats and tells you what customers asked "
                   "about, which questions the chatbot could not answer, and who left "
                   "their details wanting a call back.",
@@ -56,8 +58,19 @@ MODULES: list[dict[str, Any]] = [
         "path": "/site-health",
         "status": "live",
         "icon": "pulse",
+        "permission": "view_site_health",
         "blurb": "Checks the online shop every five minutes and emails you when a "
                   "page goes down, slows down or shows an error.",
+    },
+    {
+        "key": "assistant",
+        "label": "Assistant",
+        "path": "/assistant",
+        "status": "live",
+        "icon": "spark",
+        "permission": "administer",
+        "blurb": "Ask about our products and get an answer built from the descriptions we have "
+                  "approved and the product list from the website.",
     },
     {
         "key": "pricing-agent",
@@ -69,8 +82,12 @@ MODULES: list[dict[str, Any]] = [
     },
 ]
 
+# "permission" is the auth permission needed to open the module; the sidebar and
+# the overview leave out anything the signed-in user lacks. Those names must match
+# dashboard/auth.py -- plain strings here so this module does not import auth.
 NAV_ITEMS = [{"key": "overview", "label": "Overview", "path": "/", "icon": "grid"}] + [
-    {"key": m["key"], "label": m["label"], "path": m["path"], "icon": m.get("icon", "")}
+    {"key": m["key"], "label": m["label"], "path": m["path"], "icon": m.get("icon", ""),
+     "permission": m.get("permission", "")}
     for m in MODULES if m["status"] == "live"
 ]
 
@@ -106,6 +123,8 @@ ICONS = {
               '<path d="m21 15.5-4.6-4.4L5 20.5"/>',
     "arrow": '<path d="M5 12h13"/><path d="m12.5 5.5 6.5 6.5-6.5 6.5"/>',
     "pulse": '<path d="M3 12h4.2l2.4-6.2 4.2 12.4 2.4-6.2H21"/>',
+    "spark": '<path d="M12 3l1.9 5.2L19 10l-5.1 1.8L12 17l-1.9-5.2L5 10l5.1-1.8z"/>'
+              '<path d="M18.5 15.5l.8 2.2 2.2.8-2.2.8-.8 2.2-.8-2.2-2.2-.8 2.2-.8z"/>',
     "phone": '<path d="M21.5 16.9v2.6a1.8 1.8 0 0 1-2 1.8 17.6 17.6 0 0 1-7.7-2.7 17.3 17.3 0 0 1-5.3-5.3'
               'A17.6 17.6 0 0 1 3.8 5.5a1.8 1.8 0 0 1 1.8-2h2.6a1.8 1.8 0 0 1 1.8 1.5c.1.9.3 1.7.6 2.5a1.8 1.8 0 0 1-.4 1.9'
               'l-1.1 1.1a14 14 0 0 0 5.3 5.3l1.1-1.1a1.8 1.8 0 0 1 1.9-.4c.8.3 1.6.5 2.5.6a1.8 1.8 0 0 1 1.6 1.9z"/>',
@@ -637,6 +656,52 @@ label { font-size:12.5px; color:var(--muted); font-weight:500; }
 .spinner { width:13px; height:13px; border:2px solid var(--blue-100); border-top-color:var(--blue-600);
            border-radius:50%; display:inline-block; animation:spin .7s linear infinite; vertical-align:-2px; }
 @keyframes spin { to { transform:rotate(360deg); } }
+
+/* ---------- Assistant chat ----------
+   A conversation, not a form: questions on the right, answers on the left,
+   the composer pinned at the bottom of the thread. Answers take ten to
+   twenty-five seconds on this hardware, so the waiting state is part of the
+   design rather than an afterthought -- silence for that long reads as
+   broken. */
+.chat-thread { display:flex; flex-direction:column; gap:14px; padding:4px 2px 8px;
+               min-height:220px; max-height:min(58vh, 620px); overflow-y:auto;
+               scroll-behavior:smooth; }
+.chat-row { display:flex; gap:10px; align-items:flex-start; max-width:100%; }
+.chat-row.me { flex-direction:row-reverse; }
+.chat-avatar { flex:0 0 28px; width:28px; height:28px; border-radius:50%; display:grid;
+               place-items:center; font-size:11px; font-weight:700; color:#fff;
+               background:var(--blue-600); }
+.chat-row.me .chat-avatar { background:var(--muted); }
+.bubble { position:relative; padding:11px 14px; border-radius:14px; font-size:14px;
+          line-height:1.6; max-width:min(680px, 82%); white-space:pre-wrap;
+          overflow-wrap:anywhere; border:1px solid var(--line); background:var(--card); }
+.chat-row.me .bubble { background:var(--blue-600); border-color:var(--blue-600); color:#fff;
+                       border-bottom-right-radius:5px; }
+.chat-row.bot .bubble { border-bottom-left-radius:5px; }
+.bubble .bmeta { display:block; margin-top:8px; font-size:11px; color:var(--muted); }
+.bubble .bsources { margin-top:9px; padding-top:8px; border-top:1px dashed var(--line);
+                    display:flex; gap:6px; flex-wrap:wrap; align-items:center; }
+.bubble .bwarn { margin:-2px 0 9px; padding:8px 10px; border-radius:8px; font-size:12.5px;
+                 background:#FFF6E3; border:1px solid #F0D9A8; color:#7A5300; }
+.bubble .brate { margin-top:9px; display:flex; gap:6px; align-items:center; }
+.brate button { padding:3px 9px; font-size:11.5px; border-radius:7px; }
+.brate button[aria-pressed="true"] { outline:2px solid var(--blue-600); }
+.chat-empty { text-align:center; color:var(--muted); font-size:13.5px; padding:26px 10px; }
+.chat-empty b { display:block; color:var(--ink); font-size:15px; margin-bottom:4px; }
+.chat-suggest { background:var(--card); border:1px solid var(--line); border-radius:999px;
+                padding:6px 12px; font-size:12.5px; color:var(--blue-700); cursor:pointer;
+                margin:4px 3px 0; }
+.chat-suggest:hover { border-color:var(--blue-600); background:var(--blue-50); }
+.composer { position:sticky; bottom:0; background:var(--card); border-top:1px solid var(--line);
+            padding:12px 2px 2px; margin-top:6px; }
+.composer textarea { width:100%; resize:vertical; min-height:46px; }
+.composer .crow { display:flex; gap:10px; align-items:center; flex-wrap:wrap; margin-top:8px; }
+.typing { display:inline-flex; gap:4px; align-items:center; }
+.typing i { width:6px; height:6px; border-radius:50%; background:var(--muted);
+            animation:blink 1.2s infinite; }
+.typing i:nth-child(2) { animation-delay:.2s; }
+.typing i:nth-child(3) { animation-delay:.4s; }
+@keyframes blink { 0%, 60%, 100% { opacity:.25; } 30% { opacity:1; } }
 
 /* ---------- Table ---------- */
 table.grid { width:100%; border-collapse:collapse; font-size:13px; }
@@ -1240,7 +1305,10 @@ def _sidebar_html(active_module: str, user: dict | None, current_path: str = "")
         return (f'<a href="{item["path"]}" class="{"active" if is_active else ""}"{current}>'
                 f'{icon(item.get("icon", ""))}<span>{_esc(item["label"])}</span></a>')
 
-    links = "".join(link(i, i["key"] == active_module) for i in NAV_ITEMS)
+    from dashboard import auth
+
+    links = "".join(link(i, i["key"] == active_module) for i in NAV_ITEMS
+                    if not i.get("permission") or auth.can(user, i["permission"]))
     if user and user.get("role") == "admin":
         # Matched on the URL, not on active_module. These four share the
         # /settings prefix, so a single active_module=="settings" flag lit all
@@ -1257,7 +1325,7 @@ def _sidebar_html(active_module: str, user: dict | None, current_path: str = "")
             <div class="avatar">{_esc(initials(name))}</div>
             <div>
                 <div class="uname">{_esc(name)}</div>
-                <div class="urole">{_esc(user.get("role", ""))}</div>
+                <div class="urole">{_esc(auth.role_label(user.get("role")))}</div>
             </div>
             <form method="post" action="/logout" style="margin:0">
                 <button class="logout-btn" type="submit"
