@@ -22,9 +22,12 @@ logs/*.log
 logs/*.jsonl
 data/
 training_data/
-
 # Trained model artifacts (large binaries -- distribute separately)
 *.gguf
 
 # Reviewer-staged product images awaiting publish to the platform
 logs/product_images/
+
+
+.claude
+.idea
